@@ -114,6 +114,8 @@ def total_size(r):
 
 def get_file(s, url, dest, list_only):
     """Like _get_file, but a network error skips this file instead of stopping the run."""
+    if not list_only and os.path.exists(dest):
+        return os.path.getsize(dest)  # finished files are renamed from .part only when complete
     for attempt in (1, 2, 3):
         try:
             return _get_file(s, url, dest, list_only)
