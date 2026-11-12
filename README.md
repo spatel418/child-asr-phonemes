@@ -29,8 +29,7 @@ No data is stored in this repo. Each corpus has its own license; get it from the
 You need a TalkBank account. Credentials are never stored in the repo.
 
 ```bash
-export TALKBANK_EMAIL=you@university.edu
-export CHILD_ASR_RAW=/path/to/data/child_asr/raw
+cp .env.example .env     # then put your email and data path in .env (git-ignored)
 read -s -p "TalkBank password: " TALKBANK_PASSWORD; echo; export TALKBANK_PASSWORD
 
 python scripts/tb_download.py --list Cummings   # dry run: sizes only
