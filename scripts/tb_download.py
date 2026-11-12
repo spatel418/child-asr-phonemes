@@ -15,7 +15,7 @@ Files go to $CHILD_ASR_RAW/<corpus>/ (or --out). Set it in your shell, e.g.
 
 Re-running skips files that are already complete, so it is safe to restart.
 """
-import argparse, getpass, os, re, shutil, sys, time
+import argparse, getpass, os, re, shutil, subprocess, sys, time
 from html.parser import HTMLParser
 from urllib.parse import urljoin, urlparse
 
@@ -210,7 +210,26 @@ def crawl_media(s, url, seen=None):
             yield from crawl_media(s, f"https://media.talkbank.org{path.rstrip('/')}/", seen)  # folder
 
 
-def do_corpus(s, name, list_only):
+def video_to_audio(s, url, dest):
+    """Download one video, copy its audio track out (no re-encoding), delete the video.
+    Keeps <name>.m4a. Returns the audio size, or None on failure (video kept for a retry)."""
+    audio = os.path.splitext(dest)[0] + ".m4a"
+    if os.path.exists(audio):
+        return os.path.getsize(audio)
+    if get_file(s, url, dest, False) is None:
+        return None
+    tmp = audio + ".part.m4a"
+    r = subprocess.run(["ffmpeg", "-nostdin", "-loglevel", "error", "-y", "-i", dest,
+                        "-vn", "-map", "0:a:0", "-c:a", "copy", tmp], capture_output=True, text=True)
+    if r.returncode != 0 or not os.path.exists(tmp) or os.path.getsize(tmp) == 0:
+        log(f"  AUDIO EXTRACT FAILED, video kept: {dest} {r.stderr.strip()[:200]}")
+        return None
+    os.replace(tmp, audio)
+    os.remove(dest)
+    return os.path.getsize(audio)
+
+
+def do_corpus(s, name, list_only, audio_only=False):
     data_path, media_path, extras = CORPORA[name]
     out = os.path.join(OUT_ROOT, name)
     log(f"\n=== {name} -> {out}")
@@ -228,7 +247,11 @@ def do_corpus(s, name, list_only):
     t0 = time.time()
     for i, u in enumerate(files, 1):
         rel = urlparse(u).path.split(f"/{media_path}/", 1)[-1]
-        sz = get_file(s, u, os.path.join(out, "media", rel), list_only)
+        dest = os.path.join(out, "media", rel)
+        if audio_only and dest.lower().endswith(".mp4") and not list_only:
+            sz = video_to_audio(s, u, dest)
+        else:
+            sz = get_file(s, u, dest, list_only)
         total += sz or 0
         if i % 50 == 0 or i == len(files):
             log(f"  {i}/{len(files)} files, {total/1e9:.2f} GB, {time.time()-t0:.0f}s")
@@ -241,6 +264,7 @@ def main():
     ap.add_argument("--list", action="store_true", help="log in and report sizes; download nothing")
     ap.add_argument("--email", default=os.environ.get("TALKBANK_EMAIL"), help="or set TALKBANK_EMAIL")
     ap.add_argument("--out", default=None, help="output root (default $CHILD_ASR_RAW)")
+    ap.add_argument("--audio-only", action="store_true", help="for video (.mp4): keep only the audio track (.m4a), delete the video")
     ap.add_argument("--debug", action="store_true", help="save raw media listing pages next to the log")
     a = ap.parse_args()
     global LOG_FH, DEBUG_DIR, OUT_ROOT
@@ -263,7 +287,7 @@ def main():
     s.headers["User-Agent"] = "talkbank-download-script (research)"
     login(s, a.email)
     for n in names:
-        do_corpus(s, n, a.list)
+        do_corpus(s, n, a.list, a.audio_only)
 
 
 if __name__ == "__main__":
