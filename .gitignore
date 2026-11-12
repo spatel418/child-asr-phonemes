@@ -1,0 +1,21 @@
+# Never commit data, manifests built from data, or credentials
+data/
+*.jsonl
+*.wav
+*.zip
+_download_logs/
+.env
+*.env
+credentials*
+
+# Third-party code we read but don't redistribute (see README for links)
+external/
+
+# Private notes for now (internal decisions, contacts, unpublished work)
+RESEARCH_LOG.md
+notes/
+
+__pycache__/
+*.pyc
+*.part
+.DS_Store
