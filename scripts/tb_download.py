@@ -113,6 +113,18 @@ def total_size(r):
 
 
 def get_file(s, url, dest, list_only):
+    """Like _get_file, but a network error skips this file instead of stopping the run."""
+    for attempt in (1, 2, 3):
+        try:
+            return _get_file(s, url, dest, list_only)
+        except requests.RequestException as e:
+            log(f"  network error (try {attempt}/3): {type(e).__name__}: {url}")
+            time.sleep(10 * attempt)
+    log(f"  SKIPPED after 3 tries (re-run later to retry): {url}")
+    return None
+
+
+def _get_file(s, url, dest, list_only):
     """Download url to dest unless already complete. Returns size in bytes or None.
     Accepts 200 and 206 (this server sends 206 even without a Range request) and
     keeps asking for the rest until the file is complete."""
