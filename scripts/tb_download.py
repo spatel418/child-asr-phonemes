@@ -60,9 +60,11 @@ CORPORA = {
     "McAllister":      ("phon/Clinical/McAllister", "phon/Clinical/McAllister", []),
     "PaidoEnglish":    ("phon/Eng-NA/PaidoEnglish", "phon/Eng-NA/PaidoEnglish", []),
     "Providence":      ("phon/Eng-NA/Providence", "phon/Eng-NA/Providence", []),  # video, very large
+    # Derived set: child-only clips + word transcripts, no IPA. Audio is one zip (45 GB).
+    "CHILDES-Aligned": ("childes/Derived/CHILDES-Aligned", None, ["childes/0extra/CHILDES_Aligned.zip"]),
 }
 # 'all' skips these (too big for our disk); name them explicitly to get them
-NOT_IN_ALL = {"Providence"}
+NOT_IN_ALL = {"Providence", "CHILDES-Aligned"}
 MIN_FREE = 20e9  # stop if the project disk would drop below 20 GB free
 MEDIA_EXT = (".wav", ".mp3", ".mp4", ".m4a", ".flac", ".aif", ".aiff")
 
@@ -241,6 +243,9 @@ def do_corpus(s, name, list_only, audio_only=False):
         sz = get_file(s, f"https://media.talkbank.org/{ex}",
                       os.path.join(out, "extra", os.path.basename(ex)), list_only)
         log(f"  extra {os.path.basename(ex)}: {sz and round(sz/1e9, 2)} GB"); total += sz or 0
+    if media_path is None:  # audio comes only as the extra zip(s) above
+        log(f"  {name} total: {total/1e9:.2f} GB {'(would download)' if list_only else ''}")
+        return
     media_root = f"https://media.talkbank.org/{media_path}/"
     files = list(crawl_media(s, media_root))
     log(f"  media files found: {len(files)}")
