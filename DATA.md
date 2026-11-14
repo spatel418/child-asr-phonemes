@@ -62,7 +62,17 @@ Never train on TinyVox. It repackages these PhonBank sets.
 
 ### 1c. Audio without IPA
 
-Cameron, Ellis Weismer and OCSC have word transcripts only. Providence ages 0–2 has IPA but is held back. These could feed a self-supervised "mid-training" stage on unlabeled child audio (to be decided).
+Cameron, Ellis Weismer and OCSC have word transcripts only. So do these, which are for a future word model, not the phoneme model:
+
+| Corpus | Who | Hours | Labels |
+|---|---|---|---|
+| MyST (LDC2021S05) | 1,371 children, grades 3–5, talking to a science tutor | 473 h audio; 102,433 of 227,567 utterances transcribed | Words. Comes split into train / development / test by student; keep that split |
+| CSLU Kids (LDC2007S18) | ~1,100 children, K–grade 10 | 100 h audio | Spontaneous: word transcripts (30.6 h, one long file per child). Scripted: single prompted words, each marked only for whether the target word was said, not how. **No phone labels** |
+| CHILDES-Aligned | 49 corpora, ages 0;6–14;3 | 413 h | Words (raw CHAT and normalized) |
+
+TIMIT (LDC93S1) is adult read speech with hand-labeled phones: 3.94 h train, 1.44 h test, 630 speakers. Used for the adult forgetting test and as a small adult replay share in SFT. Its 61 phone symbols get mapped to our IPA set.
+
+Providence ages 0–2 has IPA but is held back. The word-only audio above could feed a self-supervised "mid-training" stage on unlabeled child audio (postponed until after the SFT baseline).
 
 ### 1d. Not available now
 
@@ -72,7 +82,7 @@ We plan as if these never arrive, and add them as they are if they do.
 |---|---|---|
 | DrivenData's new IPA labels for Ellis Weismer, Cameron, ENNI and the rest of PERCEPT-R | ~70 | Announced as "forthcoming" on TalkBank, not posted. Audio for all but ENNI is already downloaded |
 | ReadNet | ~25 | By request to the PI; waiting |
-| TIMIT (adult replay), MyST, CSLU Kids, CMU Kids | — | LDC; waiting on approval |
+| CMU Kids (LDC97S63) | ~5k read sentences | Not covered by our LDC access; to request |
 
 Looked at and not used: UltraSuite (phone labels follow the expected pronunciation, not what SSD children said), Korean SSD sets (wrong language for this model). speechocean762 is a maybe (L2 adult and child phone errors, not SSD).
 
@@ -98,7 +108,7 @@ All splits are **by child**, never by clip. A child in two corpora gets one ID a
 | **Test A** | Held-out children from the training corpora | Same kind of data as training |
 | **Test B** | TorringtonEaton, McAllister, JIBO | New labs and labelers |
 | **Test C** | 40 SPROUT children sealed for another study + ~15–20 more, balanced SSD / typical | Main clinical test |
-| **Adult test** | TIMIT core test, if TIMIT arrives | Forgetting |
+| **Adult test** | TIMIT test set (core test as the headline) | Forgetting |
 
 **Val must be a realistic mirror of the tests, not an easy win.** So it mixes three kinds of children: same corpora as training, a new lab (Preston), and SPROUT clinical children. Each clip carries a tag for its kind and for typical / SSD.
 - The checkpoint score averages PER **within each tag group first**, then across groups. Pooling all clips would let the biggest, easiest group dominate.
