@@ -16,7 +16,7 @@ from train_sft import collate  # noqa: E402
 
 
 def loss_and_grad(model, batch):
-    x, mask, lab, _ = collate(batch)
+    x, mask, lab, _, _ = collate(batch)
     model.zero_grad()
     out = model(input_values=x, attention_mask=mask, labels=lab)
     # per-clip loss for clip 0 only: recompute with only its row contributing
@@ -37,9 +37,9 @@ def test_padding_does_not_leak():
         if "lora_B" in n:
             torch.nn.init.normal_(p, std=0.1)
     m.eval()
-    a = (torch.randn(8000), torch.tensor([1, 2, 3]), 0)
-    short_b = (torch.randn(3000), torch.tensor([4, 5]), 1)
-    long_b = (torch.randn(16000) * 5, torch.tensor([6, 7, 8, 9]), 2)
+    a = (torch.randn(8000), torch.tensor([1, 2, 3]), torch.tensor([]), 0)
+    short_b = (torch.randn(3000), torch.tensor([4, 5]), torch.tensor([]), 1)
+    long_b = (torch.randn(16000) * 5, torch.tensor([6, 7, 8, 9]), torch.tensor([]), 2)
     la, ga = loss_and_grad(m, [a])
     l1, g1 = loss_and_grad(m, [a, short_b])
     l2, g2 = loss_and_grad(m, [a, long_b])   # A is now padded

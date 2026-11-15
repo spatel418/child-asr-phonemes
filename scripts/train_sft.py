@@ -30,12 +30,16 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import wavlm_lora  # noqa: E402
 from build_manifest import INFO_FLAGS, OUT as MANIFESTS  # noqa: E402
 from phoneset import PHONES, VERSION as PHONESET  # noqa: E402
+from wordset import BLOCKING as WORD_BLOCKING, LETTERS, VERSION as WORDSET, normalize_chat, normalize_plain  # noqa: E402
 
 DATA = os.path.dirname(MANIFESTS.rstrip("/"))
 BASE_MODEL = "microsoft/wavlm-large"
 BASE_REVISION = "c1423ed94bb01d80a3f5ce5bc39f6026a0f4828c"
 VOCAB = ["<blank>"] + PHONES          # blank = 0 = pad
 TOK = {p: i for i, p in enumerate(VOCAB)}
+WORD_VOCAB = ["<blank>", " "] + LETTERS  # aux word head (letters), training only
+WTOK = {c: i for i, c in enumerate(WORD_VOCAB)}
+WORD_CORPORA = ["MyST", "Cameron", "EllisWeismer", "OCSC"]
 SCORE_TAGS = ["indomain_typical", "indomain_SSD", "preston_SSD", "sprout_typical", "sprout_SSD"]
 TRAIN_CORPORA = ["SPROUT", "ACAD", "Cummings", "PERCEPT-R", "PERCEPT-GFTA", "Penney", "Providence"]
 VAL_CORPORA = TRAIN_CORPORA + ["Preston"]
@@ -76,6 +80,10 @@ def args_parser():
     # data mix
     a("--ssd-share", type=float, default=0.35)
     a("--child-cap", type=int, default=1000, help="clips per child at full weight")
+    # aux word head (pasketti-style): word-only clips also train the encoder
+    a("--word-weight", type=float, default=0.0, help="weight of the word CTC loss; 0 = off (old code path)")
+    a("--word-share", type=float, default=0.3, help="share of batch audio seconds from word-only clips")
+    a("--word-corpora", default=",".join(WORD_CORPORA))
     # small runs
     a("--train-limit", type=int, default=0)
     a("--val-limit", type=int, default=0)
@@ -125,9 +133,41 @@ def load_items(args):
             path, dur = processed[r["clip_id"]]
             labels = [TOK[p] for p in r["ipa_normalized"].split() if p != "|"]
             items[s].append({"path": path, "dur": dur, "labels": labels, "child": r["child_id"],
-                             "corpus": corpus, "group": r["group"], "tag": tag_of(r)})
+                             "corpus": corpus, "group": r["group"], "tag": tag_of(r),
+                             "wlabels": word_tokens(r["orthographic"], corpus)})
     checks = {f"split_{s}_sha256": sha256(os.path.join(split_dir, f"{s}.txt")) for s in ("train", "val", "testA", "testB", "testC")}
     return items, checks
+
+
+def word_tokens(text, corpus):
+    """Letter ids for the word head; [] if the text is unusable."""
+    if not isinstance(text, str):
+        return []
+    words, flags = (normalize_plain if corpus == "SPROUT" else normalize_chat)(text)
+    return [] if flags & WORD_BLOCKING else [WTOK[c] for c in words]
+
+
+def load_word_items(args):
+    """Word-only training clips (no IPA). MyST: official train part only."""
+    sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+    from build_word_manifest import usable
+    idx = os.path.join(DATA, "processed", "index")
+    processed = {}
+    for p in sorted(os.listdir(idx)):
+        if p.startswith("words-"):
+            for line in open(os.path.join(idx, p)):
+                r = json.loads(line)
+                processed[r["clip_id"]] = (r[f"{args.audio}_path"], r["duration"])
+    out = []
+    for corpus in args.word_corpora.split(","):
+        for line in open(os.path.join(MANIFESTS, "orthographic", f"{corpus}.jsonl"), encoding="utf-8"):
+            r = json.loads(line)
+            if not usable(r) or r["clip_id"] not in processed or r.get("myst_part", "train") != "train":
+                continue
+            path, dur = processed[r["clip_id"]]
+            out.append({"path": path, "dur": dur, "labels": [], "wlabels": [WTOK[c] for c in r["words"]],
+                        "child": r["child_id"], "corpus": corpus, "group": r["group"], "tag": "words"})
+    return out
 
 
 class Clips(torch.utils.data.Dataset):
@@ -142,20 +182,36 @@ class Clips(torch.utils.data.Dataset):
         y, sr = sf.read(it["path"], dtype="float32")
         assert sr == 16000
         y = (y - y.mean()) / (y.std() + 1e-7)  # WavLM feature extractor: do_normalize
-        return torch.from_numpy(y), torch.tensor(it["labels"]), i
+        return torch.from_numpy(y), torch.tensor(it["labels"]), torch.tensor(it.get("wlabels", [])), i
 
 
 def collate(batch):
     n = max(len(b[0]) for b in batch)
     x = torch.zeros(len(batch), n)
     mask = torch.zeros(len(batch), n, dtype=torch.long)
-    L = max(len(b[1]) for b in batch)
-    lab = torch.full((len(batch), L), -100, dtype=torch.long)
-    for k, (w, l, _) in enumerate(batch):
+    lab = torch.full((len(batch), max(1, max(len(b[1]) for b in batch))), -100, dtype=torch.long)
+    wlab = torch.full((len(batch), max(1, max(len(b[2]) for b in batch))), -100, dtype=torch.long)
+    for k, (w, l, wl, _) in enumerate(batch):
         x[k, : len(w)] = w
         mask[k, : len(w)] = 1
         lab[k, : len(l)] = l
-    return x, mask, lab, [b[2] for b in batch]
+        wlab[k, : len(wl)] = wl
+    return x, mask, lab, wlab, [b[3] for b in batch]
+
+
+def ctc_mean(logits, in_len, labels):
+    """Same loss as HF WavLMForCTC (ctc_loss_reduction='mean', zero_infinity), over rows with targets.
+    Returns (loss, n_rows); loss is 0 when no row has a target."""
+    tgt_len = (labels >= 0).sum(-1)
+    sel = tgt_len > 0
+    if not bool(sel.any()):
+        return logits.sum() * 0.0, 0
+    lp = torch.nn.functional.log_softmax(logits[sel], dim=-1, dtype=torch.float32).transpose(0, 1)
+    lab = labels[sel]
+    with torch.backends.cudnn.flags(enabled=False):
+        loss = torch.nn.functional.ctc_loss(lp, lab.masked_select(lab >= 0), in_len[sel], tgt_len[sel],
+                                            blank=0, reduction="mean", zero_infinity=True)
+    return loss, int(sel.sum())
 
 
 def clip_weights(items, ssd_share, child_cap):
@@ -216,6 +272,7 @@ def build_model(args, device):
         model.lm_head.bias[0] = args.blank_bias
     if getattr(args, "finetune", "lora") == "full":  # older configs have no key: LoRA
         model = model.to(device)
+        add_word_head(model, args, device)
         head = [p for n, p in model.named_parameters() if p.requires_grad and n.startswith("lm_head")]
         body = [p for n, p in model.named_parameters() if p.requires_grad and not n.startswith("lm_head")]
         assert head and body, "no trainable head or backbone"
@@ -225,10 +282,35 @@ def build_model(args, device):
                       target_modules=rf".*encoder\.layers\.\d+\.(attention|feed_forward)\.({targets})",
                       modules_to_save=["lm_head"])
     model = get_peft_model(model, lcfg).to(device)
+    add_word_head(model, args, device)
     head = [p for n, p in model.named_parameters() if p.requires_grad and "lm_head" in n]
     lora = [p for n, p in model.named_parameters() if p.requires_grad and "lora_" in n]
     assert head and lora, "no trainable head or adapters"
     return model, head, lora
+
+
+def add_word_head(model, args, device):
+    """Aux letter head on the last hidden state. Its params go LAST in every saved list, so
+    loaders that know only head + lora (eval_ckpt) still line up."""
+    if getattr(args, "word_weight", 0) > 0:
+        hid = (model.get_base_model() if hasattr(model, "get_base_model") else model).config.hidden_size
+        model.word_head = torch.nn.Linear(hid, len(WORD_VOCAB)).to(device)
+        with torch.no_grad():
+            model.word_head.bias[0] = args.blank_bias
+
+
+def word_head_params(model):
+    return list(model.word_head.parameters()) if hasattr(model, "word_head") else []
+
+
+def dual_forward(model, x, mask, lab, wlab, word_weight):
+    """Phone CTC + word_weight * word CTC from one encoder pass."""
+    base = model.get_base_model() if hasattr(model, "get_base_model") else model
+    hid = base.dropout(base.wavlm(input_values=x, attention_mask=mask)[0])
+    in_len = base._get_feat_extract_output_lengths(mask.sum(-1))
+    lp, n_p = ctc_mean(base.lm_head(hid), in_len, lab)
+    lw, n_w = ctc_mean(model.word_head(hid), in_len, wlab)
+    return lp + word_weight * lw, lp, lw, n_p, n_w
 
 
 class EMA:
@@ -293,7 +375,7 @@ def evaluate(model, loader, items, device):
     blank = frames = 0
     hyp_len = ref_len = 0
     loss_sum = loss_n = 0.0
-    for x, mask, lab, idx in loader:
+    for x, mask, lab, _, idx in loader:
         x, mask, lab = x.to(device), mask.to(device), lab.to(device)
         with torch.autocast("cuda", dtype=torch.bfloat16, enabled=device.type == "cuda"):
             out = model(input_values=x, attention_mask=mask, labels=lab)
@@ -379,27 +461,34 @@ def main():
             per = max(1, args.val_limit // len(by_tag))
             val = [it for t in sorted(by_tag) for it in rng.sample(by_tag[t], min(per, len(by_tag[t])))]
     train_sec = sum(it["dur"] for it in train)
-    steps_per_epoch = max(1, int(train_sec / args.batch_seconds))
+    word_on = args.word_weight > 0
+    words = load_word_items(args) if word_on and not args.overfit else []
+    if word_on and args.train_limit:
+        words = rng.sample(words, min(args.train_limit, len(words)))
+    # an epoch = one pass of phonetic audio; with word clips mixed in, each batch holds less of it
+    ph_share = 1 - args.word_share if words else 1.0
+    steps_per_epoch = max(1, int(train_sec / (args.batch_seconds * ph_share)))
     max_steps = args.max_steps or int(args.epochs * steps_per_epoch)
     val_every = args.val_every or max(1, int(steps_per_epoch / args.val_per_epoch))
     if args.overfit:
         val_every = args.val_every or 25
 
     model, head, lora = build_model(args, device)
+    whead = word_head_params(model)
     for p in lora:
         p.requires_grad_(False)  # head-only first
     opt = torch.optim.AdamW([
         {"params": lora, "lr": args.lr, "weight_decay": 0.0, "name": "lora"},
-        {"params": head, "lr": args.lr * args.head_lr_mult, "weight_decay": args.head_weight_decay, "name": "head"},
+        {"params": head + whead, "lr": args.lr * args.head_lr_mult, "weight_decay": args.head_weight_decay, "name": "head"},
     ], betas=(0.9, 0.98), eps=1e-8)
     base_lr = [g["lr"] for g in opt.param_groups]
-    ema = EMA(head + lora, args.ema)
+    ema = EMA(head + lora + whead, args.ema)
 
     state = {"step": 0, "best": math.inf, "bad": 0, "wandb_id": None, "slurm_jobs": []}
     last = os.path.join(args.run_dir, "last.pt")
     if os.path.exists(last):
         ck = torch.load(last, map_location=device, weights_only=False)
-        for p, v in zip(head + lora, ck["params"]):
+        for p, v in zip(head + lora + whead, ck["params"]):
             p.data.copy_(v)
         opt.load_state_dict(ck["opt"])
         ema.shadow = [s.to(device) for s in ck["ema"]]
@@ -412,7 +501,9 @@ def main():
     config = {**vars(args), "base_model": BASE_MODEL, "base_revision": BASE_REVISION, "phoneset": PHONESET,
               "vocab_size": len(VOCAB), "git_commit": git, "code_sha256": code_sha, **checks,
               "n_train_clips": len(train), "n_val_clips": len(val), "train_hours": train_sec / 3600,
-              "steps_per_epoch": steps_per_epoch, "max_steps": max_steps, "val_every": val_every,
+              "steps_per_epoch": steps_per_epoch, "wordset": WORDSET if words else None,
+              "n_word_clips": len(words), "word_hours": sum(it["dur"] for it in words) / 3600,
+              "n_train_clips_with_words": sum(bool(it["wlabels"]) for it in train), "max_steps": max_steps, "val_every": val_every,
               "slurm_jobs": state["slurm_jobs"], "torch": torch.__version__}
     json.dump(config, open(os.path.join(args.run_dir, "config.json"), "w"), indent=1)
     run = None
@@ -454,7 +545,7 @@ def main():
                                              num_workers=args.workers)
 
     def save(path):
-        torch.save({"params": [p.detach() for p in head + lora], "opt": opt.state_dict(),
+        torch.save({"params": [p.detach() for p in head + lora + whead], "opt": opt.state_dict(),
                     "ema": ema.shadow, "state": state, "config": config}, path + ".tmp")
         os.replace(path + ".tmp", path)
 
@@ -471,13 +562,23 @@ def main():
         log(m)
 
     weights = clip_weights(train, args.ssd_share, args.child_cap)
+    if words:  # mix by audio seconds: word clips get word_share of the expected batch seconds
+        per_child = collections.Counter(it["child"] for it in words)
+        ww = np.array([min(1.0, args.child_cap / per_child[it["child"]]) for it in words])
+        ww /= ww.sum()
+        d_ph = np.array([it["dur"] for it in train])
+        d_w = np.array([it["dur"] for it in words])
+        weights = np.concatenate([(1 - args.word_share) * weights / (weights @ d_ph),
+                                  args.word_share * ww / (ww @ d_w)])
+        weights /= weights.sum()
+        train = train + words
     batches = SecondsBatches(train, weights, args.batch_seconds, args.seed, state["step"])
     loader = torch.utils.data.DataLoader(Clips(train), batch_sampler=batches, collate_fn=collate,
                                          num_workers=args.workers, prefetch_factor=4 if args.workers else None,
                                          persistent_workers=args.workers > 0)
     model.train()
     t_log, sec_log, clipped, nan_count = time.time(), 0.0, 0, 0
-    for x, mask, lab, idx in loader:
+    for x, mask, lab, wlab, idx in loader:
         if state["step"] >= max_steps:
             break
         step = state["step"]
@@ -489,9 +590,14 @@ def main():
         for g, lr in zip(opt.param_groups, base_lr):
             g["lr"] = lr * (warm_head if g["name"] == "head" else warm_lora)
         x, mask, lab = x.to(device, non_blocking=True), mask.to(device), lab.to(device)
+        extra = {}
         with torch.autocast("cuda", dtype=torch.bfloat16, enabled=device.type == "cuda"):
-            out = model(input_values=x, attention_mask=mask, labels=lab)
-        loss = out.loss
+            if word_on:
+                loss, lp, lw, n_p, n_w = dual_forward(model, x, mask, lab, wlab.to(device), args.word_weight)
+                extra = {"train/loss_phone": float(lp), "train/loss_word": float(lw),
+                         "train/rows_phone": n_p, "train/rows_word": n_w}
+            else:  # old path, unchanged
+                loss = model(input_values=x, attention_mask=mask, labels=lab).loss
         if not torch.isfinite(loss):
             nan_count += 1
             opt.zero_grad(set_to_none=True)
@@ -500,7 +606,7 @@ def main():
             state["step"] += 1
             continue
         loss.backward()
-        gn = float(torch.nn.utils.clip_grad_norm_(head + lora, args.grad_clip))
+        gn = float(torch.nn.utils.clip_grad_norm_(head + lora + whead, args.grad_clip))
         clipped += gn > args.grad_clip
         opt.step()
         opt.zero_grad(set_to_none=True)
@@ -512,7 +618,7 @@ def main():
             dt = time.time() - t_log
             groups = collections.Counter(train[i]["group"] for i in idx)
             corp = collections.Counter(train[i]["corpus"] for i in idx)
-            m = {"train/loss": float(loss), "train/grad_norm": gn, "train/clip_frac": clipped / 10,
+            m = {"train/loss": float(loss), **extra, "train/grad_norm": gn, "train/clip_frac": clipped / 10,
                  "train/lr_lora": opt.param_groups[0]["lr"], "train/lr_head": opt.param_groups[1]["lr"],
                  "train/adapters_on": int(adapters_on), "train/nan_count": nan_count,
                  "train/batch_clips": len(idx), "train/batch_mean_sec": float(mask.sum()) / 16000 / len(idx),
