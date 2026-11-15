@@ -418,7 +418,7 @@ def main():
 
     def log(metrics):
         line = " ".join(f"{k}={v:.4g}" for k, v in metrics.items() if isinstance(v, (int, float)) and
-                        (k.startswith("train/loss") or k in ("val/select_score", "val/per/all", "val/blank_rate", "train/lr_lora")))
+                        (k.startswith("train/loss") or k in ("val/select_score", "val/per/all", "val/blank_rate", "train/lr_lora", "sys/audio_sec_per_sec", "sys/gpu_mem_gb")))
         print(f"STEP {state['step']} {line}", flush=True)
         if run:
             run.log({**metrics, "trainer/step": state["step"]})
