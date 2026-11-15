@@ -21,7 +21,7 @@ export HF_HOME=/projects/p32576/simron/hf_cache HF_HUB_OFFLINE=1
 unset TRANSFORMERS_CACHE
 [ -f .env ] && eval "$(grep -E "^export WANDB_|^WANDB_[A-Z_]+=" .env | sed "s/^\(WANDB_\)/export \1/")"   # only WANDB_* settings from .env
 mkdir -p "$RUN_DIR"
-echo "job $SLURM_JOB_ID host $(hostname) git $(git rev-parse --short HEAD) run $RUN_DIR"
+echo "job $SLURM_JOB_ID host $(hostname) commit $(cut -c1-8 .git/refs/heads/master 2>/dev/null) run $RUN_DIR"
 nvidia-smi --query-gpu=name,memory.total --format=csv,noheader
 $PY -I scripts/train_sft.py --run-dir "$RUN_DIR" --time-limit-min "${TLIM:-2835}" "$@"
 if [ ! -f "$RUN_DIR/DONE" ] && [ -z "${NO_CHAIN:-}" ]; then

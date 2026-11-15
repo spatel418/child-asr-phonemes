@@ -18,7 +18,6 @@ import json
 import math
 import os
 import random
-import subprocess
 import sys
 import time
 
@@ -316,6 +315,33 @@ def evaluate(model, loader, items, device):
     return m
 
 
+def code_version():
+    """Git commit read from .git (GPU nodes have no git) + a hash of the code actually run."""
+    repo = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..")
+    commit = None
+    try:
+        head = open(os.path.join(repo, ".git", "HEAD")).read().strip()
+        if head.startswith("ref: "):
+            ref = head[5:]
+            rp = os.path.join(repo, ".git", ref)
+            if os.path.exists(rp):
+                commit = open(rp).read().strip()
+            else:
+                for line in open(os.path.join(repo, ".git", "packed-refs")):
+                    if line.strip().endswith(ref):
+                        commit = line.split()[0]
+        else:
+            commit = head
+    except OSError:
+        pass
+    h = hashlib.sha256()
+    for d in ("scripts", "slurm"):
+        for f in sorted(os.listdir(os.path.join(repo, d))):
+            if f.endswith((".py", ".sbatch")):
+                h.update(f.encode() + open(os.path.join(repo, d, f), "rb").read())
+    return commit, h.hexdigest()
+
+
 # ---------------------------------------------------------------- main
 
 
@@ -373,12 +399,9 @@ def main():
     if os.environ.get("SLURM_JOB_ID"):
         state["slurm_jobs"].append(os.environ["SLURM_JOB_ID"])
 
-    git = subprocess.run(["git", "rev-parse", "HEAD"], capture_output=True, text=True,
-                         cwd=os.path.dirname(os.path.abspath(__file__))).stdout.strip()
-    dirty = bool(subprocess.run(["git", "status", "--porcelain", "--", "scripts"], capture_output=True, text=True,
-                                cwd=os.path.dirname(os.path.abspath(__file__))).stdout.strip())
+    git, code_sha = code_version()
     config = {**vars(args), "base_model": BASE_MODEL, "base_revision": BASE_REVISION, "phoneset": PHONESET,
-              "vocab_size": len(VOCAB), "git_commit": git, "git_dirty": dirty, **checks,
+              "vocab_size": len(VOCAB), "git_commit": git, "code_sha256": code_sha, **checks,
               "n_train_clips": len(train), "n_val_clips": len(val), "train_hours": train_sec / 3600,
               "steps_per_epoch": steps_per_epoch, "max_steps": max_steps, "val_every": val_every,
               "slurm_jobs": state["slurm_jobs"], "torch": torch.__version__}
@@ -433,7 +456,8 @@ def main():
     weights = clip_weights(train, args.ssd_share, args.child_cap)
     batches = SecondsBatches(train, weights, args.batch_seconds, args.seed, state["step"])
     loader = torch.utils.data.DataLoader(Clips(train), batch_sampler=batches, collate_fn=collate,
-                                         num_workers=args.workers, prefetch_factor=4, persistent_workers=True)
+                                         num_workers=args.workers, prefetch_factor=4 if args.workers else None,
+                                         persistent_workers=args.workers > 0)
     model.train()
     t_log, sec_log, clipped, nan_count = time.time(), 0.0, 0, 0
     for x, mask, lab, idx in loader:
