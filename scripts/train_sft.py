@@ -419,10 +419,15 @@ def main():
     if args.wandb == "on":
         import wandb
         state["wandb_id"] = state["wandb_id"] or secrets.token_hex(4)
-        run = wandb.init(project=os.environ.get("WANDB_PROJECT", "child-asr-phonemes"),
-                         entity=os.environ.get("WANDB_ENTITY"), id=state["wandb_id"], resume="allow",
-                         name=os.path.basename(args.run_dir.rstrip("/")), group=os.path.basename(args.run_dir.rstrip("/")),
-                         job_type="train", config=config, dir=os.environ.get("WANDB_DIR", args.run_dir))
+        kw = dict(project=os.environ.get("WANDB_PROJECT", "child-asr-phonemes"),
+                  entity=os.environ.get("WANDB_ENTITY"), id=state["wandb_id"], resume="allow",
+                  name=os.path.basename(args.run_dir.rstrip("/")), group=os.path.basename(args.run_dir.rstrip("/")),
+                  job_type="train", config=config, dir=os.environ.get("WANDB_DIR", args.run_dir))
+        try:
+            run = wandb.init(**kw)
+        except Exception as e:  # no network or W&B down: log offline; the Slurm job syncs at the end
+            print(f"wandb online init failed ({type(e).__name__}); logging offline", flush=True)
+            run = wandb.init(mode="offline", **kw)
         run.define_metric("*", step_metric="trainer/step")
 
     def log(metrics):

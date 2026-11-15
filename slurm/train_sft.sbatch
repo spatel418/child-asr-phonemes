@@ -23,7 +23,14 @@ unset TRANSFORMERS_CACHE
 mkdir -p "$RUN_DIR"
 echo "job $SLURM_JOB_ID host $(hostname) commit $(PYTHONPATH= $PY -I -c "import sys;sys.path.insert(0,\"scripts\");import train_sft;print(train_sft.code_version()[0])" 2>/dev/null | cut -c1-8) run $RUN_DIR"
 nvidia-smi --query-gpu=name,memory.total --format=csv,noheader
+set +e
 $PY -I scripts/train_sft.py --run-dir "$RUN_DIR" --time-limit-min "${TLIM:-2835}" "$@"
+RC=$?
+set -e
+for d in "$RUN_DIR"/wandb/offline-run-*; do   # upload anything logged offline (numbers only; see wandb-tracking skill)
+  [ -d "$d" ] && "$(dirname $PY)/wandb" sync "$d" >/dev/null 2>&1 && echo "synced $d to W&B" || true
+done
+[ "$RC" -ne 0 ] && exit "$RC"
 if [ ! -f "$RUN_DIR/DONE" ] && [ -z "${NO_CHAIN:-}" ]; then
   N=$(ls "$RUN_DIR"/chain_* 2>/dev/null | wc -l)
   if [ "$N" -ge 10 ]; then echo "chain limit (10 jobs) reached; not resubmitting"; exit 0; fi
