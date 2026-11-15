@@ -54,6 +54,7 @@ def test_markers_and_flags():
     assert "unintelligible" in norm("ɑ͡ɪ gɛs xxx ðæt")[1]
     assert norm("ˈbu^diz")[0] == "b u d i z"
     assert "placeholder" in norm("dVl")[1]
+    assert "typo" in norm("ʃt͡ʃɚʊB")[1]
 
 
 def test_k_release_not_doubled():

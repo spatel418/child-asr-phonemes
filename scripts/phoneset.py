@@ -61,6 +61,7 @@ UNTIED_OK = {("a", "ɪ"), ("a", "ʊ"), ("ɔ", "ɪ"), ("e", "ɪ"), ("o", "ʊ"), (
 
 UNINTELLIGIBLE = re.compile(r"^(x{2,}|χ{2,}|y{3,})$")
 PLACEHOLDER = {"V", "C"}  # Phon "some vowel/consonant": flag, don't guess
+TYPO = {"B"}              # seen once or twice, meaning unclear: flag the clip, drop the letter
 
 
 class UnknownSymbol(ValueError):
@@ -155,6 +156,9 @@ def normalize(label):
         if any(ch in PLACEHOLDER for ch in w):  # e.g. dVl: a vowel the labeler left open
             flags.add("placeholder")
             w = "".join(ch for ch in w if ch not in PLACEHOLDER)
+        if any(ch in TYPO for ch in w):
+            flags.add("typo")
+            w = "".join(ch for ch in w if ch not in TYPO)
         w = "".join(ch for ch in w if ch not in STRIP_PUNCT)
         if not w:
             continue
