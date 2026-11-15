@@ -64,6 +64,8 @@ def args_parser():
     a("--grad-clip", type=float, default=1.0)
     a("--ema", type=float, default=0.999)
     # model
+    a("--finetune", default="lora", choices=["lora", "full"],
+      help="full: train every transformer weight (CNN stays frozen); use a lower --lr, e.g. 3e-5")
     a("--lora-r", type=int, default=16)
     a("--lora-alpha", type=int, default=32)
     a("--lora-targets", default="q_proj,k_proj,v_proj,out_proj")
@@ -212,6 +214,12 @@ def build_model(args, device):
     model.freeze_feature_encoder()
     with torch.no_grad():
         model.lm_head.bias[0] = args.blank_bias
+    if getattr(args, "finetune", "lora") == "full":  # older configs have no key: LoRA
+        model = model.to(device)
+        head = [p for n, p in model.named_parameters() if p.requires_grad and n.startswith("lm_head")]
+        body = [p for n, p in model.named_parameters() if p.requires_grad and not n.startswith("lm_head")]
+        assert head and body, "no trainable head or backbone"
+        return model, head, body
     targets = "|".join(args.lora_targets.split(","))
     lcfg = LoraConfig(r=args.lora_r, lora_alpha=args.lora_alpha, lora_dropout=0.0,
                       target_modules=rf".*encoder\.layers\.\d+\.(attention|feed_forward)\.({targets})",
@@ -291,7 +299,7 @@ def evaluate(model, loader, items, device):
             out = model(input_values=x, attention_mask=mask, labels=lab)
         loss_sum += float(out.loss) * len(idx)
         loss_n += len(idx)
-        n_frames = model.base_model.model._get_feat_extract_output_lengths(mask.sum(-1)).tolist()
+        n_frames = (model.get_base_model() if hasattr(model, "get_base_model") else model)._get_feat_extract_output_lengths(mask.sum(-1)).tolist()
         hyps, ids = greedy(out.logits.float(), n_frames)
         for k, (h, i) in enumerate(zip(hyps, idx)):
             ref = items[i]["labels"]
