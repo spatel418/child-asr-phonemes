@@ -66,7 +66,8 @@ Data comes from the `phone-data` skill. Logging follows `wandb-tracking`. Plan d
 
 - Before: write the plan (what changes, why, what result would mean what) and the stop rule.
 - Log: config, git commit, seed, split checksums, base model revision, Slurm job IDs.
-- After: one row in `results.tsv`, lessons in the research log, then the `integrity-reviewer` agent.
+- After: `scripts/eval_ckpt.py` on val, shown **next to pasketti-phonetic** (`scripts/eval_pasketti.py`, same clips and phone set). The goal is to match it or come very close. Pasketti trained on SPROUT, ACAD and both PERCEPT corpora, so the fair test is the corpora it never saw.
+- Then: one row in `results.tsv`, lessons in the research log, then the `integrity-reviewer` agent.
 - A failed setup isn't rerun unless something real changed.
 
 ## When a run looks wrong
