@@ -23,3 +23,6 @@ __pycache__/
 # Claude Code: private notes and local settings
 CLAUDE.local.md
 .claude/settings.local.json
+
+# Slurm logs (may name clip IDs)
+logs/
