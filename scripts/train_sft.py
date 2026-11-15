@@ -18,6 +18,7 @@ import json
 import math
 import os
 import random
+import secrets
 import sys
 import time
 
@@ -409,7 +410,7 @@ def main():
     run = None
     if args.wandb == "on":
         import wandb
-        state["wandb_id"] = state["wandb_id"] or wandb.util.generate_id()
+        state["wandb_id"] = state["wandb_id"] or secrets.token_hex(4)
         run = wandb.init(project=os.environ.get("WANDB_PROJECT", "child-asr-phonemes"),
                          entity=os.environ.get("WANDB_ENTITY"), id=state["wandb_id"], resume="allow",
                          name=os.path.basename(args.run_dir.rstrip("/")), group=os.path.basename(args.run_dir.rstrip("/")),
