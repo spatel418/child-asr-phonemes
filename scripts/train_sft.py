@@ -421,6 +421,9 @@ def main():
         line = " ".join(f"{k}={v:.4g}" for k, v in metrics.items() if isinstance(v, (int, float)) and
                         (k.startswith("train/loss") or k in ("val/select_score", "val/per/all", "val/blank_rate", "train/lr_lora", "sys/audio_sec_per_sec", "sys/gpu_mem_gb")))
         print(f"STEP {state['step']} {line}", flush=True)
+        with open(os.path.join(args.run_dir, "metrics.jsonl"), "a") as f:  # local copy, no W&B needed
+            f.write(json.dumps({"step": state["step"], **{k: v for k, v in metrics.items()
+                                                          if isinstance(v, (int, float))}}) + "\n")
         if run:
             run.log({**metrics, "trainer/step": state["step"]})
 
