@@ -15,6 +15,11 @@ For every usable clip in the manifests (no blocking flags; Providence age 3+):
 Writes processed/<corpus>/{denoised,plain}/<clip_id>.wav (32-bit float, so -16 LUFS never clips) and
 processed/index/shard-XXXX.jsonl (clip_id, both paths, duration, how normalized).
 Same steps for train and test audio. Re-running skips clips already written.
+
+--words: word-only clips (manifests/orthographic, for the word head). Same steps, but saved as
+16-bit FLAC at the level before loudness normalization, with the gain in the index (about 7x
+smaller). Training rescales each clip to unit variance anyway, so the gain changes nothing there.
+Index: processed/index/words-shard-XXXX.jsonl.
 """
 import argparse
 import collections
@@ -31,12 +36,14 @@ import soxr
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from build_manifest import INFO_FLAGS, OUT  # noqa: E402
+from build_word_manifest import usable as word_usable  # noqa: E402
 
 warnings.filterwarnings("ignore", message="Possible clipped samples")  # float output: nothing clips
 TARGET_SR = 16000
 TARGET_LUFS = -16.0
 PEAK_SHORT = 0.5      # linear peak for clips under 0.4 s (about what -16 LUFS speech peaks at)
 PROCESSED = os.path.join(os.path.dirname(OUT.rstrip("/")), "processed")
+WORD_CORPORA = ["Cameron", "EllisWeismer", "OCSC", "MyST"]
 CORPORA = ["SPROUT", "ACAD", "Cummings", "PERCEPT-R", "PERCEPT-GFTA", "Penney", "Providence",
            "Preston", "TorringtonEaton", "McAllister"]
 
@@ -86,20 +93,22 @@ def main():
     ap.add_argument("--nshards", type=int, default=1)
     ap.add_argument("--corpus", action="append", help="only these corpora")
     ap.add_argument("--limit", type=int, default=0, help="only this many source files (testing)")
+    ap.add_argument("--words", action="store_true", help="word-only manifests, FLAC output")
     args = ap.parse_args()
     import noisereduce as nr
 
     by_source = collections.defaultdict(list)
-    for c in args.corpus or CORPORA:
-        for line in open(os.path.join(OUT, "phonetic", f"{c}.jsonl"), encoding="utf-8"):
+    kind_dir, ok = ("orthographic", word_usable) if args.words else ("phonetic", usable)
+    for c in args.corpus or (WORD_CORPORA if args.words else CORPORA):
+        for line in open(os.path.join(OUT, kind_dir, f"{c}.jsonl"), encoding="utf-8"):
             r = json.loads(line)
-            if usable(r) and zlib.crc32(r["source_path"].encode()) % args.nshards == args.shard:
+            if ok(r) and zlib.crc32(r["source_path"].encode()) % args.nshards == args.shard:
                 by_source[r["source_path"]].append(r)
     sources = sorted(by_source)
     if args.limit:
         sources = sources[: args.limit]
     os.makedirs(os.path.join(PROCESSED, "index"), exist_ok=True)
-    index_path = os.path.join(PROCESSED, "index", f"shard-{args.shard:04d}.jsonl")
+    index_path = os.path.join(PROCESSED, "index", f"{'words-' if args.words else ''}shard-{args.shard:04d}.jsonl")
     done = set()
     if os.path.exists(index_path):
         done = {json.loads(l)["clip_id"] for l in open(index_path)}
@@ -125,11 +134,21 @@ def main():
                     continue
                 out = {"clip_id": r["clip_id"], "corpus": r["corpus"], "source_sr": sr}
                 for kind, sig in (("denoised", y_dn), ("plain", y)):
-                    clip, how = normalize(sig[a:b], sr)
-                    clip = to16k(clip, sr)
-                    p = os.path.join(PROCESSED, r["corpus"], kind, f"{r['clip_id']}.wav")
-                    os.makedirs(os.path.dirname(p), exist_ok=True)
-                    sf.write(p, clip, TARGET_SR, subtype="FLOAT")
+                    raw_clip = sig[a:b]
+                    clip, how = normalize(raw_clip, sr)
+                    if args.words:  # save the un-normalized level as 16-bit FLAC, keep the gain
+                        peak = float(np.max(np.abs(raw_clip))) or 1.0
+                        gain = float(np.max(np.abs(clip))) / peak if how != "silent" else 1.0
+                        clip = np.clip(to16k(raw_clip, sr), -1.0, 1.0)
+                        p = os.path.join(PROCESSED, r["corpus"], kind, f"{r['clip_id']}.flac")
+                        os.makedirs(os.path.dirname(p), exist_ok=True)
+                        sf.write(p, clip, TARGET_SR, subtype="PCM_16")
+                        out[f"{kind}_gain"] = round(gain, 6)
+                    else:
+                        clip = to16k(clip, sr)
+                        p = os.path.join(PROCESSED, r["corpus"], kind, f"{r['clip_id']}.wav")
+                        os.makedirs(os.path.dirname(p), exist_ok=True)
+                        sf.write(p, clip, TARGET_SR, subtype="FLOAT")
                     out[f"{kind}_path"], out[f"{kind}_norm"] = p, how
                 out["duration"] = round(len(clip) / TARGET_SR, 3)
                 idx.write(json.dumps(out) + "\n")

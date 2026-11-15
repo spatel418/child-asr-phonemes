@@ -1,6 +1,7 @@
 #!/bin/bash
 # Audio prep for all usable clips (scripts/prep_audio.py): 64 CPU tasks.
-#   sbatch slurm/prep_audio.sbatch
+#   sbatch slurm/prep_audio.sbatch            # phonetic clips
+#   sbatch slurm/prep_audio.sbatch --words    # word-only clips (FLAC)
 # Safe to resubmit: finished clips are skipped.
 #SBATCH --job-name=prep_audio
 #SBATCH --account=p32576
@@ -15,4 +16,4 @@ cd /projects/p32576/simron/repos/pasketti-rlvr
 PY=/projects/p32576/simron/envs/pasketti-phonetic/bin/python
 export OMP_NUM_THREADS=2
 echo "git $(git rev-parse --short HEAD) host $(hostname) task $SLURM_ARRAY_TASK_ID"
-$PY -I scripts/prep_audio.py --shard "$SLURM_ARRAY_TASK_ID" --nshards 64
+$PY -I scripts/prep_audio.py --shard "$SLURM_ARRAY_TASK_ID" --nshards 64 "$@"
