@@ -18,6 +18,8 @@ PY=/projects/p32576/simron/envs/pasketti-phonetic/bin/python
 export HF_HOME=/projects/p32576/simron/hf_cache HF_HUB_OFFLINE=1
 unset TRANSFORMERS_CACHE
 [ -f .env ] && eval "$(grep -E "^export WANDB_|^WANDB_[A-Z_]+=" .env | sed "s/^\(WANDB_\)/export \1/")"   # only WANDB_* settings from .env
+# Queued behind an SFT run: refuse to start unless that run finished (SFT chains can end a job without DONE).
+if [ -n "${REQUIRE_DONE:-}" ] && [ ! -f "$REQUIRE_DONE/DONE" ]; then echo "$REQUIRE_DONE has no DONE: not starting"; exit 1; fi
 # Twin submissions (same run queued twice with different time limits): keep whichever starts first.
 if [ -n "${TWIN_DIR:-}" ] && [ -f "$TWIN_DIR/config.json" ]; then echo "twin $TWIN_DIR already started; exiting"; exit 0; fi
 [ -n "${TWIN_JOB:-}" ] && scancel "$TWIN_JOB" 2>/dev/null && echo "cancelled twin job $TWIN_JOB" || true
