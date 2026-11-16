@@ -50,6 +50,8 @@ def args_parser():
     a = ap.add_argument
     a("--run-dir", required=True)
     a("--splits", default="v2")
+    a("--train-children", default=None,
+      help="optional file of child IDs (one per line): train only on these, a subset of the split's train children")
     a("--audio", default="denoised", choices=["denoised", "plain"])
     a("--seed", type=int, default=0)
     # schedule (in steps)
@@ -136,6 +138,13 @@ def load_items(args):
                              "corpus": corpus, "group": r["group"], "tag": tag_of(r),
                              "wlabels": word_tokens(r["orthographic"], corpus)})
     checks = {f"split_{s}_sha256": sha256(os.path.join(split_dir, f"{s}.txt")) for s in ("train", "val", "testA", "testB", "testC")}
+    sub = getattr(args, "train_children", None)
+    if sub:
+        keep = set(open(sub).read().split())
+        assert keep <= {c for c, s in split_of.items() if s == "train"}, "train-children must be split train children"
+        items["train"] = [it for it in items["train"] if it["child"] in keep]
+        checks["train_children_sha256"] = sha256(sub)
+        checks["train_children_n"] = len(keep)
     return items, checks
 
 

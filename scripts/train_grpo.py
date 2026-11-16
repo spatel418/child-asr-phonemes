@@ -39,6 +39,7 @@ def args_parser():
     a("--init", required=True, help="SFT run dir; its best.pt (EMA or live, as chosen there) is the start and the KL anchor")
     a("--run-dir", required=True)
     a("--seed", type=int, default=0)
+    a("--train-children", default=None, help="RL on these train children only (default: the SFT run's train children)")
     a("--group", type=int, default=16, help="guesses per clip")
     a("--temperature", type=float, default=1.0)
     a("--baseline", default="group", choices=["group", "greedy"],
@@ -318,6 +319,8 @@ def main():
         p.requires_grad_(False)  # word head: not used in RL, saved unchanged
     torch.manual_seed(args.seed)
     cfg = argparse.Namespace(**sft_cfg)
+    if args.train_children:
+        cfg.train_children = args.train_children
     items, checks = T.load_items(cfg)
     train, val = items["train"], items["val"]
     rng = random.Random(args.seed)
