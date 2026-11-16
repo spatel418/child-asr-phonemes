@@ -10,7 +10,7 @@ Labels used below:
 - **[proposed]**: suggested, not agreed yet.
 - **[open]**: needs a decision.
 
-Last updated: 2026-11-05.
+Last updated: 2026-11-15 (Stage 4: current WavLM-CTC recipe, word head).
 
 ---
 
@@ -163,6 +163,49 @@ Score these before training anything, on validation and test, split by group:
   - **Noisy labels:** score each training clip with a second model (WER, or PER for phonemes), train at a few cut-off levels, and average. Don't drop SSD clips just for disagreeing.
   - **Data:** every top team added DrivenData's TalkBank set (about 255k extra utterances). Drop the known bad clip `U_b8a4e8220e65219b`.
   - **Long clips:** split by forced alignment, or chunk and pseudo-label. Never truncate audio while keeping the full label.
+#### Current WavLM-CTC recipe (as run, 2026-11-15)
+
+What our runs actually use. Results and history: `RESEARCH_LOG.md`. Terms: `docs/glossary.md`.
+
+- **[decided] Base:** WavLM Large + CTC phone head (45 tokens, phoneset v1). CNN frozen.
+- **[decided] LoRA r16** (alpha 32) on q, k, v, out in all 24 layers. Full fine-tune was worse at our settings (0.401 vs 0.370, denoised).
+- **[decided] Plain audio**, not denoised (0.332 vs 0.370 val PER, one seed each; seed-1 check still to run).
+- **Optimizer:** AdamW, LR 3e-4 (head 3x), weight decay 0.01 on the head, grad clip 1.0, EMA 0.999.
+- **Schedule:** 300 head-only steps, 500 warmup steps, then constant LR. 10 epochs (11,880 steps), batch 200 s of audio.
+- **Init:** blank bias -2.0 on the phone head.
+- **Sampling:** at most 1,000 clips per child. SSD clips boosted to 35% of sampling weight.
+- **Checkpoint choice:** val select score (PER averaged over 5 groups), EMA or live, whichever is better.
+- **Every result** is shown next to pasketti-phonetic on the same val clips (`scripts/eval_pasketti.py`).
+
+#### Auxiliary word head [testing]
+
+- **What:** a second CTC output on the same encoder that predicts letters (a-z, space, '; 29 tokens) from clips with only word transcripts. Thrown away at test time.
+- **Data:** MyST train, OCSC, Ellis Weismer, Cameron: 232,386 clips, about 192 h. Text rules: `scripts/wordset.py` (w1).
+- **Settings:** loss = phone CTC + 0.3 x word CTC (`--word-weight 0.3`). 30% of each batch's audio seconds are word-only clips (`--word-share 0.3`). Steps per epoch are scaled up by 1/0.7, so the phone data seen equals a run without the word head.
+- **Why it should help:**
+  - Phone labels are scarce (about 116 h). Word transcripts add far more child speech to train the shared encoder.
+  - Words are made of sounds, so learning words pushes the encoder to tell the same sounds apart.
+  - Word labels are more consistent across corpora than phone conventions.
+- **Where it comes from:**
+  - pasketti-phonetic (1st place phonetic track) used a word head (Parakeet BPE, weight 0.3, 371 h word-only): [DrivenData winners post](https://blog.drivendata.org/blog/on-top-of-pasketti-winners), code `phonetic-track/1st Place`.
+  - Krishna, Toshniwal & Livescu 2018, Hierarchical multitask learning for CTC-based speech recognition ([arXiv 1807.06234](https://arxiv.org/abs/1807.06234)): a phone CTC output helped word recognition, most with little data.
+  - Sanabria & Metze 2018, Hierarchical multitask learning with CTC ([arXiv 1807.07104](https://arxiv.org/abs/1807.07104)): stacked CTC outputs from characters up to words help each other.
+  - Kusunoki et al. 2024, Hierarchical recursive CTC ([Interspeech 2024](https://www.isca-archive.org/interspeech_2024/kusunoki24_interspeech.html)).
+  - Caveat: those papers use the extra output to help words. We use words to help phones. No peer-reviewed paper found doing this for child phone recognition; the evidence for our direction is pasketti and our own runs.
+- **To look into later:**
+  - Word weight (0.1 / 0.3 / 0.5) and word share.
+  - Letters vs BPE tokens (pasketti used BPE).
+  - Put the word head on a middle layer (the hierarchical papers) instead of the last layer.
+  - Add CSLU Kids spontaneous speech (needs utterance timing first).
+
+#### Other items to test later
+
+- Gradient clip cap: every step is clipped at 1.0 now (grad norm about 2.3). Try a higher cap.
+- LR decay (cosine to zero, like pasketti).
+- Full fine-tune on plain audio, with LR decay.
+- Seed reruns, to measure how much scores move by luck.
+- SPROUT val has only 15 children (3 SSD): SSD-vs-typical val numbers are noisy.
+
 - **Adult replay [proposed]:** mix adult phonetic data into SFT. Start around 20–30% adult. Try 2–3 ratios on validation. No separate continued-pretraining stage unless forgetting shows up. Continued pretraining on unlabeled audio matters more for self-supervised encoders like WavLM than for Qwen3-ASR.
 - **Balance:** consider oversampling SSD children if they are a small share of training hours.
 - **Framework [open]:**
