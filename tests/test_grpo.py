@@ -92,6 +92,19 @@ def test_mutual_info_basic():
     assert abs(G.mutual_info(same, n)[0]) < 1e-6 and G.mutual_info(diff, n)[0] > 1.0
 
 
+def test_epoch_batches_cover_every_clip_once():
+    items = [{"dur": float(d)} for d in np.random.default_rng(0).uniform(0.5, 8, 2000)]
+    b, used = G.epoch_batches(len(items), items, 60.0, 0, 0, {}, 0.1)
+    flat = [i for x in b for i in x]
+    assert used == 2000 and sorted(flat) == list(range(2000))
+    assert all(max(items[i]["dur"] for i in x) * len(x) <= 60.0 or len(x) == 1 for x in b)
+    b2, _ = G.epoch_batches(len(items), items, 60.0, 0, 1, {}, 0.1)
+    assert [i for x in b2 for i in x] != flat   # new shuffle each epoch
+    skip = {i: 0 for i in range(1000)}
+    b3, used3 = G.epoch_batches(len(items), items, 60.0, 0, 0, skip, 0.0)
+    assert used3 == 1000 and min(i for x in b3 for i in x) == 1000
+
+
 if __name__ == "__main__":
     for name, f in list(globals().items()):
         if name.startswith("test_"):

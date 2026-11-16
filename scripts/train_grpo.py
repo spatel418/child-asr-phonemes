@@ -50,7 +50,11 @@ def args_parser():
     a("--max-batch-seconds", type=float, default=150.0, help="cap on drawn audio when refilling for dropped groups")
     a("--recheck-prob", type=float, default=0.1, help="chance a skip-listed clip is drawn anyway")
     a("--ssd-share", type=float, default=None, help="default: the SFT run's value")
-    a("--max-steps", type=int, default=2000)
+    a("--max-steps", type=int, default=2000, help="cap on steps (epoch mode: stops at whichever comes first)")
+    a("--epochs", type=int, default=0,
+      help="0: random weighted draws (old mode). N>0: N plain passes, every train clip once per pass, shuffled, no SSD weighting")
+    a("--curve-every", type=int, default=200, help="fixed-clip reward curve every N steps (0: off)")
+    a("--curve-clips", type=int, default=500, help="fixed clips per split for the curve")
     a("--val-every", type=int, default=250)
     a("--val-limit", type=int, default=0)
     a("--patience", type=int, default=4)
@@ -212,12 +216,24 @@ def batches_by_seconds(ids, items, seconds):
     return out + ([cur] if cur else [])
 
 
+def epoch_batches(n_items, items, seconds, seed, epoch, skip, recheck, chunk=512):
+    """One plain pass: shuffle all clips, cut into chunks, length-sort inside a chunk (less padding),
+    batch by seconds, shuffle batch order. Skip-listed (all-perfect) clips are left out unless re-checked."""
+    rng = np.random.default_rng([seed, 1000 + epoch])
+    ids = [int(i) for i in rng.permutation(n_items) if int(i) not in skip or rng.random() < recheck]
+    out = []
+    for c in range(0, len(ids), chunk):
+        out += batches_by_seconds(ids[c:c + chunk], items, seconds)
+    order = rng.permutation(len(out))
+    return [out[j] for j in order], len(ids)
+
+
 @torch.no_grad()
 def probe_set(model, ds, items, ids, args, device):
     """Sample G guesses per clip; zero-spread shares under -PER and 0/1 exact match."""
     c = collections.Counter()
     ref_n = greedy_err = 0
-    sample_per = []
+    sample_per, best_err = [], 0
     for b in batches_by_seconds(ids, items, args.batch_seconds):
         x, mask = load_batch(ds, b, device)
         with torch.autocast("cuda", dtype=torch.bfloat16, enabled=device.type == "cuda"):
@@ -232,6 +248,7 @@ def probe_set(model, ds, items, ids, args, device):
             _, keep, solved = group_stats(r)
             exact = [h == ref for h in hyps[k]]
             sample_per.append(-r.mean())
+            best_err += min(Levenshtein.distance(ref, h) for h in hyps[k])  # oracle: best of the G guesses
             c["clips"] += 1
             c["zero_spread"] += int(not keep[0])
             c["solved"] += int(solved[0])
@@ -240,6 +257,7 @@ def probe_set(model, ds, items, ids, args, device):
             c["distinct"] += len({tuple(h) for h in hyps[k]})
     n_ = max(c["clips"], 1)
     return {"clips": c["clips"], "greedy_per": greedy_err / max(ref_n, 1), "mean_sample_per": float(np.mean(sample_per)),
+            "best_of_g_per": best_err / max(ref_n, 1),
             "zero_spread_share": c["zero_spread"] / n_, "solved_share": c["solved"] / n_,
             "same_wrong_share": c["same_wrong"] / n_, "exact01_zero_spread_share": c["exact_zero_spread"] / n_,
             "mean_distinct_guesses": c["distinct"] / n_}
@@ -311,6 +329,9 @@ def main():
         val = [val[i] for i in val_subset(val, args.val_limit, rng)]
         val_ds = T.Clips(val)
     mi_ids = val_subset(val, args.mi_clips, random.Random(1234))  # same clips in every run
+    crng = random.Random(4321)  # fixed-clip curve: the same clips at every point and in every run
+    curve_tr = crng.sample(range(len(train)), min(args.curve_clips, len(train)))
+    curve_va = val_subset(val, args.curve_clips, crng)
     val_loader = torch.utils.data.DataLoader(val_ds, batch_sampler=batches_by_seconds(range(len(val)), val, 200.0),
                                              collate_fn=T.collate, num_workers=args.workers)
     ssd_share = args.ssd_share if args.ssd_share is not None else sft_cfg["ssd_share"]
@@ -319,7 +340,7 @@ def main():
     params = head + lora
     opt = torch.optim.AdamW(params, lr=args.lr, betas=(0.9, 0.98), eps=1e-8, weight_decay=0.0)
     state = {"step": 0, "best": math.inf, "bad": 0, "wandb_id": None, "slurm_jobs": [], "skip": {},
-             "keep_ema": 1.0, "best_is_ema": False}
+             "keep_ema": 1.0, "best_is_ema": False, "epoch": 0, "pos": 0, "plan": None, "epoch_clips": []}
     last = os.path.join(args.run_dir, "last.pt")
     if os.path.exists(last):
         ck = torch.load(last, map_location=device, weights_only=False)
@@ -367,6 +388,16 @@ def main():
                     "ema": [p.detach() for p in head + lora + whead], "state": state, "config": config}, path + ".tmp")
         os.replace(path + ".tmp", path)
 
+    def curve():
+        m = {}
+        for name, ds_, its, ids in (("train", train_ds, train, curve_tr), ("val", val_ds, val, curve_va)):
+            pr = probe_set(model, ds_, its, ids, args, device)
+            m.update({f"curve/{name}_reward": -pr["mean_sample_per"], f"curve/{name}_greedy_per": pr["greedy_per"],
+                      f"curve/{name}_distinct": pr["mean_distinct_guesses"],
+                      f"curve/{name}_best_of_g_per": pr["best_of_g_per"], f"curve/{name}_solved": pr["solved_share"]})
+        print(f"CURVE {state['step']} " + " ".join(f"{k.split('/')[1]}={v:.4f}" for k, v in m.items()), flush=True)
+        return m
+
     def run_val():
         m = T.evaluate(model, val_loader, val, device)
         model.eval()  # evaluate() leaves the model in train mode
@@ -378,10 +409,13 @@ def main():
         m.update({k.replace("val/", "sft_start/"): v for k, v in m.items() if k.startswith("val/")})
         log(m)
         state["best"] = m["val/select_score"]
+        if args.curve_every:
+            m.update(curve())
+            log(m)
         save(os.path.join(args.run_dir, "best.pt"))
 
     t0, clipped = time.time(), collections.deque(maxlen=10)
-    while state["step"] < args.max_steps:
+    while state["step"] < args.max_steps:  # epoch mode also breaks after the last epoch
         if (time.time() - t0) / 60 > args.time_limit_min:
             save(last)
             print("time limit: saved last.pt", flush=True)
@@ -391,7 +425,22 @@ def main():
             g["lr"] = args.lr * min(1.0, (k + 1) / max(1, args.warmup_steps))
         seconds = min(args.max_batch_seconds, args.batch_seconds / max(state["keep_ema"], 1e-3))
         skip = state["skip"]
-        idx = draw(k, seconds, skip, args.recheck_prob)
+        if args.epochs:
+            if state["plan"] is None or state["pos"] >= len(state["plan"]):
+                if state["plan"] is not None:
+                    state["epoch"] += 1
+                if state["epoch"] >= args.epochs:
+                    break
+                state["plan"], used = epoch_batches(len(train), train, seconds, args.seed, state["epoch"], skip,
+                                                    args.recheck_prob)
+                state["pos"] = 0
+                state["epoch_clips"].append(used)
+                print(f"EPOCH {state['epoch']} {used} clips ({len(train) - used} skip-listed), "
+                      f"{len(state['plan'])} batches", flush=True)
+            idx = state["plan"][state["pos"]]
+            state["pos"] += 1
+        else:
+            idx = draw(k, seconds, skip, args.recheck_prob)
         ts = time.time()
         x, mask = load_batch(train_ds, idx, device)
         with torch.autocast("cuda", dtype=torch.bfloat16, enabled=device.type == "cuda"):
@@ -432,7 +481,10 @@ def main():
              "rl/distinct_guesses": float(np.mean([len({tuple(h) for h in row}) for row in hyps])),
              "rl/kl": st["kl"], "rl/kl_all": st["kl_all"], "rl/entropy": st["entropy"], "rl/pg": st["pg"],
              "train/loss": float(loss), "train/grad_norm": gn, "train/clip_frac": sum(clipped) / max(1, len(clipped)),
-             "train/lr": opt.param_groups[0]["lr"], "sys/step_time": time.time() - ts}
+             "train/lr": opt.param_groups[0]["lr"], "sys/step_time": time.time() - ts,
+             "rl/epoch": state["epoch"] + (state["pos"] / max(1, len(state["plan"])) if args.epochs else 0.0)}
+        if args.curve_every and state["step"] % args.curve_every == 0:
+            m.update(curve())
         if state["step"] % args.val_every == 0 or state["step"] == args.max_steps:
             m.update(run_val())
             if m["val/select_score"] < state["best"]:
@@ -446,8 +498,17 @@ def main():
             if state["bad"] >= args.patience:
                 print("early stop", flush=True)
                 break
-        elif state["step"] % 10 == 0:
+        elif state["step"] % 10 == 0 or any(k_.startswith("curve/") for k_ in m):
             log(m)
+    if args.epochs and state["step"] % args.val_every and state["bad"] < args.patience:  # end of last epoch: one final val
+        m = run_val()
+        if m["val/select_score"] < state["best"]:
+            state["best"] = m["val/select_score"]
+            save(os.path.join(args.run_dir, "best.pt"))
+        m["val/best_select_score"] = state["best"]
+        if args.curve_every:
+            m.update(curve())
+        log(m)
     save(last)
     open(os.path.join(args.run_dir, "DONE"), "w").write(f"step {state['step']}\n")
     print(f"done at step {state['step']}, best select_score {state['best']:.4f}", flush=True)
