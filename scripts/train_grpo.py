@@ -41,6 +41,9 @@ def args_parser():
     a("--seed", type=int, default=0)
     a("--group", type=int, default=16, help="guesses per clip")
     a("--temperature", type=float, default=1.0)
+    a("--baseline", default="group", choices=["group", "greedy"],
+      help="group: reward minus group mean (GRPO). greedy: reward minus the greedy answer's reward (self-critical)")
+    a("--pos-only", action="store_true", help="greedy baseline: only guesses that beat greedy get a (positive) push")
     a("--beta", type=float, default=0.03, help="KL weight to the frozen SFT copy")
     a("--clip-eps", type=float, default=0.2, help="PPO ratio clip (inactive with one update per batch)")
     a("--lr", type=float, default=2e-5)
@@ -109,6 +112,19 @@ def group_stats(r, eps=1e-6):
     keep = std[:, 0] > eps
     adv = np.where(keep[:, None], (r - mean) / (std + 1e-4), 0.0)
     solved = (~keep) & (np.abs(r).max(1) < eps)
+    return adv, keep, solved
+
+
+def greedy_stats(r, rg, pos_only=False, eps=1e-6):
+    """Self-critical advantages: d = r - r_greedy per guess, scaled by the group's RMS of d.
+    r [B, G], rg [B]. keep [B]: some guess differs from greedy in reward. solved [B]: all guesses perfect."""
+    d = r - rg[:, None]
+    if pos_only:
+        d = np.maximum(d, 0.0)
+    rms = np.sqrt((d ** 2).mean(1, keepdims=True))
+    keep = rms[:, 0] > eps
+    adv = np.where(keep[:, None], d / (rms + 1e-4), 0.0)
+    solved = np.abs(r).max(1) < eps
     return adv, keep, solved
 
 
@@ -388,10 +404,12 @@ def main():
                     "ema": [p.detach() for p in head + lora + whead], "state": state, "config": config}, path + ".tmp")
         os.replace(path + ".tmp", path)
 
+    curve_args = argparse.Namespace(**{**vars(args), "temperature": 1.0})
+
     def curve():
         m = {}
         for name, ds_, its, ids in (("train", train_ds, train, curve_tr), ("val", val_ds, val, curve_va)):
-            pr = probe_set(model, ds_, its, ids, args, device)
+            pr = probe_set(model, ds_, its, ids, curve_args, device)  # always T=1.0: comparable across runs
             m.update({f"curve/{name}_reward": -pr["mean_sample_per"], f"curve/{name}_greedy_per": pr["greedy_per"],
                       f"curve/{name}_distinct": pr["mean_distinct_guesses"],
                       f"curve/{name}_best_of_g_per": pr["best_of_g_per"], f"curve/{name}_solved": pr["solved_share"]})
@@ -450,7 +468,13 @@ def main():
         paths = sample_paths(logits, n, args.group, args.temperature)
         hyps = collapse(paths)
         r = np.array([[-per(train[i]["labels"], h) for h in hyps[b]] for b, i in enumerate(idx)])
-        adv, keep, solved = group_stats(r)
+        g_hyp, _ = T.greedy(logits.detach().float(), n.tolist())
+        refs = [train[i]["labels"] for i in idx]
+        rg = np.array([-per(a_, b_) for a_, b_ in zip(refs, g_hyp)])
+        if args.baseline == "greedy":
+            adv, keep, solved = greedy_stats(r, rg, args.pos_only)
+        else:
+            adv, keep, solved = group_stats(r)
         for b, i in enumerate(idx):  # skip list: all-perfect clips; a re-checked clip with spread comes off it
             if solved[b]:
                 skip[i] = k
@@ -469,12 +493,12 @@ def main():
         state["keep_ema"] = 0.9 * state["keep_ema"] + 0.1 * float(keep.mean())
         state["step"] += 1
 
-        g_hyp, _ = T.greedy(logits.detach().float(), n.tolist())
-        refs = [train[i]["labels"] for i in idx]
         hl = sum(len(h) for row in hyps for h in row) / len(hyps[0])
         m = {"rl/reward_all": float(r.mean()), "rl/reward_kept": float(r[keep].mean()) if keep.any() else float("nan"),
              "rl/greedy_per_train": sum(Levenshtein.distance(a, b) for a, b in zip(refs, g_hyp)) / max(1, sum(map(len, refs))),
-             "rl/kept_frac": float(keep.mean()), "rl/solved_frac": float(solved.mean()),
+             "rl/kept_frac": float(keep.mean()),
+             "rl/beat_greedy_frac": float((r > rg[:, None] + 1e-9).mean()),
+             "rl/worse_than_greedy_frac": float((r < rg[:, None] - 1e-9).mean()), "rl/solved_frac": float(solved.mean()),
              "rl/same_wrong_frac": float(((~keep) & (~solved)).mean()), "rl/skip_list_size": len(skip),
              "rl/clips": len(idx), "rl/batch_seconds": float(mask.sum()) / 16000,
              "rl/sample_len_ratio": hl / max(1, sum(map(len, refs))),

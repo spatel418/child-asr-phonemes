@@ -105,6 +105,16 @@ def test_epoch_batches_cover_every_clip_once():
     assert used3 == 1000 and min(i for x in b3 for i in x) == 1000
 
 
+def test_greedy_stats():
+    r = np.array([[-0.2, -0.2, -0.1, -0.3], [-0.2, -0.2, -0.2, -0.2], [0.0, 0.0, 0.0, 0.0]])
+    rg = np.array([-0.2, -0.2, -0.1])
+    adv, keep, solved = G.greedy_stats(r, rg)
+    assert keep.tolist() == [True, False, True] and solved.tolist() == [False, False, True]
+    assert adv[0, 2] > 0 > adv[0, 3] and adv[0, 0] == 0 and (adv[1] == 0).all()
+    adv_p, _, _ = G.greedy_stats(r, rg, pos_only=True)
+    assert adv_p[0, 2] > 0 and (adv_p[0, [0, 1, 3]] == 0).all()
+
+
 if __name__ == "__main__":
     for name, f in list(globals().items()):
         if name.startswith("test_"):
