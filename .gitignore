@@ -27,3 +27,6 @@ CLAUDE.local.md
 # Slurm logs (may name clip IDs)
 logs/
 RUNS
+
+# W&B local run folders (debug logs name the user)
+wandb/
