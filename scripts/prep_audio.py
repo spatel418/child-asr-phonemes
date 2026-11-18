@@ -94,12 +94,29 @@ def main():
     ap.add_argument("--corpus", action="append", help="only these corpora")
     ap.add_argument("--limit", type=int, default=0, help="only this many source files (testing)")
     ap.add_argument("--words", action="store_true", help="word-only manifests, FLAC output")
+    ap.add_argument("--providence-age2", default=None,
+                    help="child-ID file: ONLY Providence clips at age 2 (24-35 months) from these children; "
+                         "own index files (prov2-shard-XXXX.jsonl)")
+    ap.add_argument("--providence-age1", default=None,
+                    help="child-ID file: ONLY Providence clips at age 1 (12-23 months) from these children; "
+                         "own index files (prov1-shard-XXXX.jsonl)")
     args = ap.parse_args()
     import noisereduce as nr
 
     by_source = collections.defaultdict(list)
     kind_dir, ok = ("orthographic", word_usable) if args.words else ("phonetic", usable)
-    for c in args.corpus or (WORD_CORPORA if args.words else CORPORA):
+    corpora = args.corpus or (WORD_CORPORA if args.words else CORPORA)
+    if args.providence_age2:
+        kids = set(open(args.providence_age2).read().split())
+        ok = lambda r: (not (set(r["flags"]) - INFO_FLAGS) and bool(r["source_path"])  # noqa: E731
+                        and r["child_id"] in kids and 24 <= (r["age_months"] or 0) < 36)
+        corpora = ["Providence"]
+    if args.providence_age1:
+        kids1 = set(open(args.providence_age1).read().split())
+        ok = lambda r: (not (set(r["flags"]) - INFO_FLAGS) and bool(r["source_path"])  # noqa: E731
+                        and r["child_id"] in kids1 and 12 <= (r["age_months"] or 0) < 24)
+        corpora = ["Providence"]
+    for c in corpora:
         for line in open(os.path.join(OUT, kind_dir, f"{c}.jsonl"), encoding="utf-8"):
             r = json.loads(line)
             if ok(r) and zlib.crc32(r["source_path"].encode()) % args.nshards == args.shard:
@@ -108,7 +125,7 @@ def main():
     if args.limit:
         sources = sources[: args.limit]
     os.makedirs(os.path.join(PROCESSED, "index"), exist_ok=True)
-    index_path = os.path.join(PROCESSED, "index", f"{'words-' if args.words else ''}shard-{args.shard:04d}.jsonl")
+    index_path = os.path.join(PROCESSED, "index", f"{'words-' if args.words else 'prov2-' if args.providence_age2 else 'prov1-' if args.providence_age1 else ''}shard-{args.shard:04d}.jsonl")
     done = set()
     if os.path.exists(index_path):
         done = {json.loads(l)["clip_id"] for l in open(index_path)}
