@@ -115,6 +115,37 @@ def test_greedy_stats():
     assert adv_p[0, 2] > 0 and (adv_p[0, [0, 1, 3]] == 0).all()
 
 
+def test_mwer_step_moves_odds_to_lower_risk_hypothesis():
+    torch.manual_seed(0)
+    m = model_with_heads()
+    params = [p for p in m.parameters() if p.requires_grad]
+    opt = torch.optim.SGD(params, lr=0.5)
+    lg, n = G.frame_logits(m, x[:1], mask[:1])
+    nbest = [[[1, 2], [3]]]           # hypothesis 0 is right (risk 0), hypothesis 1 is wrong (risk 1)
+    risk = [[0.0, 1.0]]
+
+    def gap(lg_):
+        lp = torch.log_softmax(lg_.float(), -1).transpose(0, 1)
+        nll = [torch.nn.functional.ctc_loss(lp, torch.tensor([h]), n, torch.tensor([len(h)]), reduction="sum")
+               for h in nbest[0]]
+        return float(nll[1] - nll[0])  # log p(right) - log p(wrong)
+
+    before = gap(lg.detach())
+    loss, st = G.mwer_loss(lg, n, nbest, risk, np.array([True]), [[1, 2]], 0.0)
+    assert 0.0 <= st["expected_per"] <= 1.0 and 0.5 <= st["top1_mass"] <= 1.0
+    loss.backward()
+    opt.step()
+    assert gap(G.frame_logits(m, x[:1], mask[:1])[0].detach()) > before
+
+
+def test_mwer_dropped_clips_give_no_grad():
+    m = model_with_heads()
+    lg, n = G.frame_logits(m, x, mask)
+    loss, _ = G.mwer_loss(lg, n, [[[1]], [[2]], [[3]]], [[0.5], [0.5], [0.5]], np.array([False] * 3), [[1]] * 3, 0.0)
+    loss.backward()
+    assert all(p.grad is None or p.grad.abs().sum() == 0 for p in m.parameters())
+
+
 if __name__ == "__main__":
     for name, f in list(globals().items()):
         if name.startswith("test_"):

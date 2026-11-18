@@ -31,6 +31,7 @@ from rapidfuzz.distance import Levenshtein
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import train_sft as T  # noqa: E402
+import nbest_ceiling as NB  # noqa: E402  (beam search for --loss mwer)
 
 
 def args_parser():
@@ -45,6 +46,14 @@ def args_parser():
     a("--baseline", default="group", choices=["group", "greedy"],
       help="group: reward minus group mean (GRPO). greedy: reward minus the greedy answer's reward (self-critical)")
     a("--pos-only", action="store_true", help="greedy baseline: only guesses that beat greedy get a (positive) push")
+    a("--reward", default="per", choices=["per", "per_fa"],
+      help="per: 1 - PER (all runs so far). per_fa: also minus fa_weight x false-alarm rate (share of the "
+           "consonants the child said correctly, per the dictionary target, that the guess drops or changes)")
+    a("--fa-weight", type=float, default=1.0)
+    a("--loss", default="grpo", choices=["grpo", "mwer"],
+      help="grpo: sampled paths + advantages. mwer: beam N-best, minimise expected PER under the model's own odds")
+    a("--nbest", type=int, default=8, help="mwer: hypotheses per clip (from a beam of 2x this)")
+    a("--ctc-weight", type=float, default=0.01, help="mwer: weight of plain CTC on the reference (safety net)")
     a("--beta", type=float, default=0.03, help="KL weight to the frozen SFT copy")
     a("--clip-eps", type=float, default=0.2, help="PPO ratio clip (inactive with one update per batch)")
     a("--lr", type=float, default=2e-5)
@@ -107,6 +116,33 @@ def per(ref, hyp):
     return Levenshtein.distance(ref, hyp) / max(len(ref), 1)
 
 
+FA_TARGETS = None  # set in main when --reward per_fa: clip id -> (target phones, correct-consonant mask)
+
+
+def false_alarm(item, hyp_ids):
+    """Share of the target consonants the child said correctly that this guess drops or changes. None if the
+    clip has no dictionary target (then it keeps the plain PER reward)."""
+    t = item.get("fa")
+    if t is None:
+        return None
+    import target_bias as TB
+    target, mask = t
+    n = sum(mask)
+    if n == 0:
+        return 0.0
+    al = TB.align(target, [T.VOCAB[h] for h in hyp_ids])
+    return sum(1 for j, m in enumerate(mask) if m and not (al[j] is not None and TB.ok(target[j], al[j]))) / n
+
+
+def reward(item, hyp_ids, args):
+    r = -per(item["labels"], hyp_ids)
+    if args.reward == "per_fa":
+        fa = false_alarm(item, hyp_ids)
+        if fa is not None:
+            r -= args.fa_weight * fa
+    return r
+
+
 def group_stats(r, eps=1e-6):
     """r [B, G] rewards -> advantages [B, G], keep [B] (has spread), solved [B] (all perfect)."""
     mean, std = r.mean(1, keepdims=True), r.std(1, keepdims=True)
@@ -152,6 +188,51 @@ def grpo_loss(logits, n, paths, adv, keep, ref_logits, beta, temperature, clip_e
              "entropy": float((ent_t * fm).sum() / fm.sum()),
              "pg": float(pg_mean)}
     return pg_mean + beta * kl_mean, stats
+
+
+def mwer_loss(logits, n, nbest, risk, keep, refs, ctc_weight):
+    """MWER over beam N-best (Prabhavalkar et al. 2018), for CTC.
+    nbest: list (B) of lists of phone-id lists (<= N each); risk: list (B) of lists of PER per hypothesis;
+    keep [B] bool: clips whose N-best risks differ. For each kept clip: w = softmax over the N-best of the
+    CTC log p(y|x) (with grad), loss = sum_i w_i (risk_i - mean risk). Plus ctc_weight * CTC on the reference.
+    Returns loss, stats."""
+    B = logits.shape[0]
+    lp = torch.log_softmax(logits.float(), -1)                      # [B, T, V]
+    rows, tgts, tlen = [], [], []
+    for b in range(B):
+        if keep[b]:
+            for h in nbest[b]:
+                rows.append(b)
+                tgts += h
+                tlen.append(len(h))
+    dev = logits.device
+    stats = {"mwer": 0.0, "expected_per": float("nan"), "top1_mass": float("nan"), "ctc_ref": 0.0}
+    total = logits.sum() * 0.0
+    if rows:
+        r_ = torch.tensor(rows, device=dev)
+        nll = torch.nn.functional.ctc_loss(lp[r_].transpose(0, 1), torch.tensor(tgts, device=dev, dtype=torch.long),
+                                           n[r_], torch.tensor(tlen, device=dev), reduction="none", zero_infinity=True)
+        s, losses, exp_r, top = 0, [], [], []
+        for b in range(B):
+            if not keep[b]:
+                continue
+            k = len(nbest[b])
+            w = torch.softmax(-nll[s:s + k], 0)
+            rk = torch.tensor(risk[b], device=dev, dtype=torch.float32)
+            losses.append((w * (rk - rk.mean())).sum())
+            exp_r.append(float((w.detach() * rk).sum()))
+            top.append(float(w.detach().max()))
+            s += k
+        total = torch.stack(losses).mean()
+        stats.update(mwer=float(total), expected_per=float(np.mean(exp_r)), top1_mass=float(np.mean(top)))
+    if ctc_weight > 0:
+        ctc = torch.nn.functional.ctc_loss(lp.transpose(0, 1), torch.tensor([p for r in refs for p in r], device=dev),
+                                           n, torch.tensor([len(r) for r in refs], device=dev),
+                                           reduction="none", zero_infinity=True)
+        ctc = (ctc / torch.tensor([max(1, len(r)) for r in refs], device=dev)).mean()
+        total = total + ctc_weight * ctc
+        stats["ctc_ref"] = float(ctc)
+    return total, stats
 
 
 def mutual_info(logits, n):
@@ -323,6 +404,14 @@ def main():
         cfg.train_children = args.train_children
     items, checks = T.load_items(cfg)
     train, val = items["train"], items["val"]
+    if args.reward == "per_fa":
+        tpath = os.path.join(T.DATA, "targets", "v1", "targets.jsonl")
+        tg = {r["cid"]: (r["target"], r["correct"]) for r in map(json.loads, open(tpath, encoding="utf-8")) if r["split"] == "train"}
+        for it in train:
+            it["fa"] = tg.get(os.path.splitext(os.path.basename(it["path"]))[0])
+        checks["fa_targets_sha256"] = T.sha256(tpath)
+        checks["fa_train_coverage"] = sum(it["fa"] is not None for it in train) / max(len(train), 1)
+        print(f"false-alarm targets on {checks['fa_train_coverage']:.1%} of train clips", flush=True)
     rng = random.Random(args.seed)
     if args.train_limit:
         train = rng.sample(train, min(args.train_limit, len(train)))
@@ -468,48 +557,92 @@ def main():
             logits, n = frame_logits(model, x, mask)
             with torch.no_grad():
                 ref_logits, _ = frame_logits(ref_model, x, mask)
-        paths = sample_paths(logits, n, args.group, args.temperature)
-        hyps = collapse(paths)
-        r = np.array([[-per(train[i]["labels"], h) for h in hyps[b]] for b, i in enumerate(idx)])
-        g_hyp, _ = T.greedy(logits.detach().float(), n.tolist())
-        refs = [train[i]["labels"] for i in idx]
-        rg = np.array([-per(a_, b_) for a_, b_ in zip(refs, g_hyp)])
-        if args.baseline == "greedy":
-            adv, keep, solved = greedy_stats(r, rg, args.pos_only)
-        else:
-            adv, keep, solved = group_stats(r)
-        for b, i in enumerate(idx):  # skip list: all-perfect clips; a re-checked clip with spread comes off it
-            if solved[b]:
-                skip[i] = k
-            elif keep[b]:
-                skip.pop(i, None)
-        loss, st = grpo_loss(logits, n, paths, torch.tensor(adv, device=device, dtype=torch.float32),
-                             torch.tensor(keep, device=device), ref_logits, args.beta, args.temperature, args.clip_eps)
-        opt.zero_grad(set_to_none=True)
-        if keep.any():
+        if args.loss == "mwer":
+            lp_np = torch.log_softmax(logits.detach().float(), -1).cpu().numpy()
+            refs = [train[i]["labels"] for i in idx]
+            nbest, risk = [], []
+            for b, i in enumerate(idx):
+                hb = [h for h, _ in NB.prefix_beam(lp_np[b, : int(n[b])], beam=2 * args.nbest)[: args.nbest]]
+                nbest.append(hb)
+                risk.append([per(refs[b], h) for h in hb])
+            keep = np.array([len(rk) > 1 and max(rk) - min(rk) > 1e-9 for rk in risk])
+            solved = np.array([max(rk) < 1e-9 for rk in risk])
+            for b, i in enumerate(idx):
+                if solved[b]:
+                    skip[i] = k
+                elif keep[b]:
+                    skip.pop(i, None)
+            loss, st = mwer_loss(logits, n, nbest, risk, keep, refs, args.ctc_weight)
+            lp1 = torch.log_softmax(logits.float(), -1)
+            lq = torch.log_softmax(ref_logits.float(), -1)
+            fm = frame_mask(n, logits.shape[1]).float()
+            kl = (((lp1.exp() * (lp1 - lq)).sum(-1) * fm).sum(-1) / fm.sum(-1).clamp(min=1)).mean()
+            loss = loss + args.beta * kl
+            opt.zero_grad(set_to_none=True)
             loss.backward()
             gn = float(torch.nn.utils.clip_grad_norm_(params, args.grad_clip))
             clipped.append(gn > args.grad_clip)
             opt.step()
+            state["keep_ema"] = 0.9 * state["keep_ema"] + 0.1 * float(keep.mean())
+            state["step"] += 1
+            g_hyp, _ = T.greedy(logits.detach().float(), n.tolist())
+            ref_len = max(1, sum(map(len, refs)))
+            m = {"rl/greedy_per_train": sum(Levenshtein.distance(a_, b_) for a_, b_ in zip(refs, g_hyp)) / ref_len,
+                 "rl/beam1_per_train": sum(Levenshtein.distance(r_, h[0]) for r_, h in zip(refs, nbest) if h) / ref_len,
+                 "rl/oracle_per_train": sum(min(rk) * len(r_) for r_, rk in zip(refs, risk) if rk) / ref_len,
+                 "rl/expected_per": st["expected_per"], "rl/top1_mass": st["top1_mass"], "rl/mwer": st["mwer"],
+                 "rl/ctc_ref": st["ctc_ref"], "rl/kl": float(kl), "rl/kept_frac": float(keep.mean()),
+                 "rl/solved_frac": float(solved.mean()), "rl/skip_list_size": len(skip),
+                 "rl/clips": len(idx), "rl/batch_seconds": float(mask.sum()) / 16000,
+                 "train/loss": float(loss), "train/grad_norm": gn, "train/clip_frac": sum(clipped) / max(1, len(clipped)),
+                 "train/lr": opt.param_groups[0]["lr"], "sys/step_time": time.time() - ts,
+                 "rl/epoch": state["epoch"] + (state["pos"] / max(1, len(state["plan"])) if args.epochs else 0.0)}
         else:
-            gn = 0.0
-        state["keep_ema"] = 0.9 * state["keep_ema"] + 0.1 * float(keep.mean())
-        state["step"] += 1
+            paths = sample_paths(logits, n, args.group, args.temperature)
+            hyps = collapse(paths)
+            r = np.array([[reward(train[i], h, args) for h in hyps[b]] for b, i in enumerate(idx)])
+            g_hyp, _ = T.greedy(logits.detach().float(), n.tolist())
+            refs = [train[i]["labels"] for i in idx]
+            rg = np.array([reward(train[i], g_hyp[b], args) for b, i in enumerate(idx)])
+            if args.baseline == "greedy":
+                adv, keep, solved = greedy_stats(r, rg, args.pos_only)
+            else:
+                adv, keep, solved = group_stats(r)
+            for b, i in enumerate(idx):  # skip list: all-perfect clips; a re-checked clip with spread comes off it
+                if solved[b]:
+                    skip[i] = k
+                elif keep[b]:
+                    skip.pop(i, None)
+            loss, st = grpo_loss(logits, n, paths, torch.tensor(adv, device=device, dtype=torch.float32),
+                                 torch.tensor(keep, device=device), ref_logits, args.beta, args.temperature, args.clip_eps)
+            opt.zero_grad(set_to_none=True)
+            if keep.any():
+                loss.backward()
+                gn = float(torch.nn.utils.clip_grad_norm_(params, args.grad_clip))
+                clipped.append(gn > args.grad_clip)
+                opt.step()
+            else:
+                gn = 0.0
+            state["keep_ema"] = 0.9 * state["keep_ema"] + 0.1 * float(keep.mean())
+            state["step"] += 1
 
-        hl = sum(len(h) for row in hyps for h in row) / len(hyps[0])
-        m = {"rl/reward_all": float(r.mean()), "rl/reward_kept": float(r[keep].mean()) if keep.any() else float("nan"),
-             "rl/greedy_per_train": sum(Levenshtein.distance(a, b) for a, b in zip(refs, g_hyp)) / max(1, sum(map(len, refs))),
-             "rl/kept_frac": float(keep.mean()),
-             "rl/beat_greedy_frac": float((r > rg[:, None] + 1e-9).mean()),
-             "rl/worse_than_greedy_frac": float((r < rg[:, None] - 1e-9).mean()), "rl/solved_frac": float(solved.mean()),
-             "rl/same_wrong_frac": float(((~keep) & (~solved)).mean()), "rl/skip_list_size": len(skip),
-             "rl/clips": len(idx), "rl/batch_seconds": float(mask.sum()) / 16000,
-             "rl/sample_len_ratio": hl / max(1, sum(map(len, refs))),
-             "rl/distinct_guesses": float(np.mean([len({tuple(h) for h in row}) for row in hyps])),
-             "rl/kl": st["kl"], "rl/kl_all": st["kl_all"], "rl/entropy": st["entropy"], "rl/pg": st["pg"],
-             "train/loss": float(loss), "train/grad_norm": gn, "train/clip_frac": sum(clipped) / max(1, len(clipped)),
-             "train/lr": opt.param_groups[0]["lr"], "sys/step_time": time.time() - ts,
-             "rl/epoch": state["epoch"] + (state["pos"] / max(1, len(state["plan"])) if args.epochs else 0.0)}
+            hl = sum(len(h) for row in hyps for h in row) / len(hyps[0])
+            fa_g = [false_alarm(train[i], g_hyp[b]) for b, i in enumerate(idx)] if args.reward == "per_fa" else []
+            fa_g = [x for x in fa_g if x is not None]
+            m = {"rl/reward_all": float(r.mean()), "rl/reward_kept": float(r[keep].mean()) if keep.any() else float("nan"),
+                 **({"rl/fa_greedy_train": float(np.mean(fa_g))} if fa_g else {}),
+                 "rl/greedy_per_train": sum(Levenshtein.distance(a, b) for a, b in zip(refs, g_hyp)) / max(1, sum(map(len, refs))),
+                 "rl/kept_frac": float(keep.mean()),
+                 "rl/beat_greedy_frac": float((r > rg[:, None] + 1e-9).mean()),
+                 "rl/worse_than_greedy_frac": float((r < rg[:, None] - 1e-9).mean()), "rl/solved_frac": float(solved.mean()),
+                 "rl/same_wrong_frac": float(((~keep) & (~solved)).mean()), "rl/skip_list_size": len(skip),
+                 "rl/clips": len(idx), "rl/batch_seconds": float(mask.sum()) / 16000,
+                 "rl/sample_len_ratio": hl / max(1, sum(map(len, refs))),
+                 "rl/distinct_guesses": float(np.mean([len({tuple(h) for h in row}) for row in hyps])),
+                 "rl/kl": st["kl"], "rl/kl_all": st["kl_all"], "rl/entropy": st["entropy"], "rl/pg": st["pg"],
+                 "train/loss": float(loss), "train/grad_norm": gn, "train/clip_frac": sum(clipped) / max(1, len(clipped)),
+                 "train/lr": opt.param_groups[0]["lr"], "sys/step_time": time.time() - ts,
+                 "rl/epoch": state["epoch"] + (state["pos"] / max(1, len(state["plan"])) if args.epochs else 0.0)}
         if args.curve_every and state["step"] % args.curve_every == 0:
             m.update(curve())
         if state["step"] % args.val_every == 0 or state["step"] == args.max_steps:

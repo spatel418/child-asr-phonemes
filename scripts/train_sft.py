@@ -59,6 +59,8 @@ def args_parser():
     a("--max-steps", type=int, default=0, help="overrides --epochs")
     a("--batch-seconds", type=float, default=200, help="padded audio seconds per batch")
     a("--warmup-steps", type=int, default=500)
+    a("--lr-decay", default="none", choices=["none", "cosine"],
+      help="cosine: after warmup, decay both LRs to 0 at max_steps (default none = flat, as in all runs so far)")
     a("--head-only-steps", type=int, default=300)
     a("--val-per-epoch", type=float, default=4)
     a("--val-every", type=int, default=0, help="overrides --val-per-epoch")
@@ -82,6 +84,12 @@ def args_parser():
     # data mix
     a("--ssd-share", type=float, default=0.35)
     a("--child-cap", type=int, default=1000, help="clips per child at full weight")
+    a("--providence-age2", action="store_true",
+      help="add Providence age-2 clips (24-35 months) of TRAIN children; val/test never get them")
+    a("--providence-age1", action="store_true",
+      help="also add Providence age-1 clips (12-23 months) of TRAIN children; val/test never get them")
+    a("--base-weights", default=None,
+      help="WavLM backbone dir (HF save_pretrained, e.g. RUNS/midtrain-v1/wavlm) instead of the hub WavLM-Large")
     # aux word head (pasketti-style): word-only clips also train the encoder
     a("--word-weight", type=float, default=0.0, help="weight of the word CTC loss; 0 = off (old code path)")
     a("--word-share", type=float, default=0.3, help="share of batch audio seconds from word-only clips")
@@ -132,6 +140,12 @@ def load_items(args):
                 raise RuntimeError("sealed child reached train/val: stop")  # never expected
             if s == "train" and corpus not in TRAIN_CORPORA:
                 continue
+            if corpus == "Providence" and (r["age_months"] or 0) < 36:   # held back (DATA.md); age 2 of train
+                age = r["age_months"] or 0
+                ok2 = getattr(args, "providence_age2", False) and 24 <= age          # train children only,
+                ok1 = getattr(args, "providence_age1", False) and 12 <= age < 24     # each behind a flag
+                if not (s == "train" and (ok1 or ok2)):
+                    continue
             path, dur = processed[r["clip_id"]]
             labels = [TOK[p] for p in r["ipa_normalized"].split() if p != "|"]
             items[s].append({"path": path, "dur": dur, "labels": labels, "child": r["child_id"],
@@ -269,13 +283,14 @@ def build_model(args, device):
 
     wavlm_lora.patch()  # without it, LoRA on WavLM attention does nothing (tests/test_wavlm_lora.py)
     path = snapshot_download(BASE_MODEL, revision=BASE_REVISION)
+    base = getattr(args, "base_weights", None) or path  # older configs have no key: hub weights
     d = args.dropout
     cfg = WavLMConfig.from_pretrained(
         path, vocab_size=len(VOCAB), pad_token_id=0, ctc_loss_reduction="mean", ctc_zero_infinity=True,
         layerdrop=args.layerdrop, hidden_dropout=d, attention_dropout=d, activation_dropout=d,
         feat_proj_dropout=d, final_dropout=d, mask_time_prob=args.mask_time_prob, mask_feature_prob=0.0)
     torch.manual_seed(args.seed)
-    model = WavLMForCTC.from_pretrained(path, config=cfg)
+    model = WavLMForCTC.from_pretrained(base, config=cfg)
     model.freeze_feature_encoder()
     with torch.no_grad():
         model.lm_head.bias[0] = args.blank_bias
@@ -596,8 +611,12 @@ def main():
             p.requires_grad_(adapters_on)
         warm_head = min(1.0, (step + 1) / args.warmup_steps)
         warm_lora = min(1.0, max(0, step - args.head_only_steps + 1) / args.warmup_steps)  # from switch-on
+        decay = 1.0
+        if getattr(args, "lr_decay", "none") == "cosine":
+            s0 = args.head_only_steps + args.warmup_steps
+            decay = 0.5 * (1 + math.cos(math.pi * min(1.0, max(0, step - s0) / max(1, max_steps - s0))))
         for g, lr in zip(opt.param_groups, base_lr):
-            g["lr"] = lr * (warm_head if g["name"] == "head" else warm_lora)
+            g["lr"] = lr * (warm_head if g["name"] == "head" else warm_lora) * decay
         x, mask, lab = x.to(device, non_blocking=True), mask.to(device), lab.to(device)
         extra = {}
         with torch.autocast("cuda", dtype=torch.bfloat16, enabled=device.type == "cuda"):
