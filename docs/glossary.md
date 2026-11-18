@@ -20,6 +20,21 @@ Pasketti is about 1.06.
 **select score.** The number we use to pick the best checkpoint: PER averaged over five groups so that no one
 big corpus drowns out the rest.
 
+**target.** The dictionary pronunciation of the word the child meant to say (from CMUdict). Not what the
+child said.
+
+**child error.** A target consonant the child said differently, according to the human transcription.
+
+**detected / target bias.** Of the child errors, detected = the model also wrote something other than the
+target. Target bias = the model wrote the target instead, so it "corrected" the child. They add up to 1.
+Target bias matters clinically: it hides speech errors.
+
+**false alarm.** A consonant the child said correctly that the model marked as wrong (often by dropping it).
+Too many false alarms make a typical child look disordered.
+
+**PCC (percent consonants correct).** The share of target consonants a child says correctly. A standard
+clinical score. We compute it twice per child: from the human transcription and from the model output.
+
 ## How the model learns
 
 **CTC (connectionist temporal classification).** The model makes one guess every 20 ms. Labels say only which

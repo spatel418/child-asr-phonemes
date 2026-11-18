@@ -26,3 +26,7 @@ One line each. Longer versions: [glossary.md](glossary.md).
 | val | Held-out children used to compare runs. Never trained on. |
 | Test A / B / C | Final test sets. Not opened until the final model. |
 | pasketti-phonetic | DrivenData's public child phoneme model. Our baseline. |
+| target | Dictionary pronunciation of the intended word, not what the child said. |
+| target bias | Child said it wrong, model wrote the correct target anyway. Hides errors. |
+| false alarm | Child said it right, model marked it wrong. Makes typical kids look disordered. |
+| PCC | Percent consonants correct: a standard clinical score per child. |
