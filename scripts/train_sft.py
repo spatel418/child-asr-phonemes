@@ -81,6 +81,10 @@ def args_parser():
     a("--layerdrop", type=float, default=0.0)
     a("--dropout", type=float, default=0.0)
     a("--mask-time-prob", type=float, default=0.0, help="SpecAugment; off until regularize stage")
+    a("--speed-perturb", default="", help="train-clip speed factors, e.g. 0.9,1.0,1.1 (Kaldi-style: tempo and pitch "
+      "change together; one factor drawn per clip). Empty = off")
+    a("--vtlp", type=float, default=0.0, help="frequency warp: all frequencies (pitch and formants) scaled by a factor "
+      "drawn uniformly from [1-v, 1+v], length kept (waveform pitch shift). 0 = off")
     # data mix
     a("--ssd-share", type=float, default=0.35)
     a("--child-cap", type=int, default=1000, help="clips per child at full weight")
@@ -193,9 +197,26 @@ def load_word_items(args):
     return out
 
 
+def augment(y, speeds=(), vtlp=0.0):
+    """Train-time waveform augmentation (16 kHz). Random draws use torch, which DataLoader seeds per worker."""
+    if speeds:
+        f = speeds[int(torch.randint(len(speeds), ()))]
+        if f != 1.0:
+            from fractions import Fraction
+            from scipy.signal import resample_poly
+            q = Fraction(f).limit_denominator(100)   # speed f: play f x faster -> length / f
+            y = resample_poly(y, q.denominator, q.numerator).astype(np.float32)
+    if vtlp > 0:
+        alpha = 1.0 + (2 * float(torch.rand(())) - 1) * vtlp
+        if abs(alpha - 1.0) > 1e-3:
+            import librosa
+            y = librosa.effects.pitch_shift(y, sr=16000, n_steps=12 * np.log2(alpha)).astype(np.float32)
+    return y
+
+
 class Clips(torch.utils.data.Dataset):
-    def __init__(self, items):
-        self.items = items
+    def __init__(self, items, speeds=(), vtlp=0.0):
+        self.items, self.speeds, self.vtlp = items, tuple(speeds), vtlp
 
     def __len__(self):
         return len(self.items)
@@ -204,6 +225,8 @@ class Clips(torch.utils.data.Dataset):
         it = self.items[i]
         y, sr = sf.read(it["path"], dtype="float32")
         assert sr == 16000
+        if self.speeds or self.vtlp:
+            y = augment(y, self.speeds, self.vtlp)
         y = (y - y.mean()) / (y.std() + 1e-7)  # WavLM feature extractor: do_normalize
         return torch.from_numpy(y), torch.tensor(it["labels"]), torch.tensor(it.get("wlabels", [])), i
 
@@ -597,7 +620,8 @@ def main():
         weights /= weights.sum()
         train = train + words
     batches = SecondsBatches(train, weights, args.batch_seconds, args.seed, state["step"])
-    loader = torch.utils.data.DataLoader(Clips(train), batch_sampler=batches, collate_fn=collate,
+    speeds = [float(v) for v in args.speed_perturb.split(",") if v.strip()] if getattr(args, "speed_perturb", "") else []
+    loader = torch.utils.data.DataLoader(Clips(train, speeds, getattr(args, "vtlp", 0.0)), batch_sampler=batches, collate_fn=collate,
                                          num_workers=args.workers, prefetch_factor=4 if args.workers else None,
                                          persistent_workers=args.workers > 0)
     model.train()
