@@ -46,9 +46,10 @@ def args_parser():
     a("--baseline", default="group", choices=["group", "greedy"],
       help="group: reward minus group mean (GRPO). greedy: reward minus the greedy answer's reward (self-critical)")
     a("--pos-only", action="store_true", help="greedy baseline: only guesses that beat greedy get a (positive) push")
-    a("--reward", default="per", choices=["per", "per_fa"],
+    a("--reward", default="per", choices=["per", "per_fa", "fper"],
       help="per: 1 - PER (all runs so far). per_fa: also minus fa_weight x false-alarm rate (share of the "
-           "consonants the child said correctly, per the dictionary target, that the guess drops or changes)")
+           "consonants the child said correctly, per the dictionary target, that the guess drops or changes). "
+           "fper: 1 - feature-weighted PER (a swap costs its sound distance 0..1; see phone_distance.py)")
     a("--fa-weight", type=float, default=1.0)
     a("--loss", default="grpo", choices=["grpo", "mwer"],
       help="grpo: sampled paths + advantages. mwer: beam N-best, minimise expected PER under the model's own odds")
@@ -134,7 +135,13 @@ def false_alarm(item, hyp_ids):
     return sum(1 for j, m in enumerate(mask) if m and not (al[j] is not None and TB.ok(target[j], al[j]))) / n
 
 
+FPER_COST = None  # set in main when --reward fper: substitution cost matrix by vocab id
+
+
 def reward(item, hyp_ids, args):
+    if args.reward == "fper":
+        import phone_distance as PD
+        return -PD.fper(item["labels"], hyp_ids, FPER_COST)
     r = -per(item["labels"], hyp_ids)
     if args.reward == "per_fa":
         fa = false_alarm(item, hyp_ids)
@@ -404,6 +411,13 @@ def main():
         cfg.train_children = args.train_children
     items, checks = T.load_items(cfg)
     train, val = items["train"], items["val"]
+    if args.reward == "fper":
+        import hashlib
+        import phone_distance as PD
+        global FPER_COST
+        FPER_COST = PD.cost_matrix(T.VOCAB)
+        checks["fper_cost_sha256"] = hashlib.sha256(FPER_COST.tobytes()).hexdigest()
+        print(f"fper reward: cost matrix {FPER_COST.shape}, mean swap cost {FPER_COST[1:, 1:].mean():.3f}", flush=True)
     if args.reward == "per_fa":
         tpath = os.path.join(T.DATA, "targets", "v1", "targets.jsonl")
         tg = {r["cid"]: (r["target"], r["correct"]) for r in map(json.loads, open(tpath, encoding="utf-8")) if r["split"] == "train"}
